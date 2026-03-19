@@ -488,7 +488,7 @@ The replay buffer holds the last 100KB of terminal output. When you reconnect, t
 
 ### Option A: macOS App (Recommended)
 
-1. **Download** the DMG from Releases and drag Remote Claude to Applications
+1. **[Download the DMG](https://github.com/MadsLangkilde/remote-claude/releases/latest)** and drag Remote Claude to Applications
 2. **Launch** it — a mic icon appears in your menu bar
 3. **Click it** and select **Setup Guide...** — this walks you through everything:
    - Checks Node.js and Claude Code are installed
@@ -538,7 +538,7 @@ Or build a full DMG installer:
 
 ```bash
 # Clone
-git clone https://github.com/madsvejen/remote-claude.git
+git clone https://github.com/MadsLangkilde/remote-claude.git
 cd remote-claude
 
 # Install dependencies
