@@ -1,0 +1,7 @@
+node_modules/
+certs/
+*.log
+*.pid
+*.dmg
+.onboarding-complete
+.DS_Store
