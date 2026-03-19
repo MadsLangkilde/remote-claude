@@ -50,6 +50,17 @@ mkdir -p "${APP_BUNDLE}/Contents/Resources"
 cp macos-app/RemoteClaude "${APP_BUNDLE}/Contents/MacOS/"
 cp macos-app/RemoteClaude.icns "${APP_BUNDLE}/Contents/Resources/"
 
+# Bundle server files so the app is self-contained
+SERVER_RES="${APP_BUNDLE}/Contents/Resources/server"
+mkdir -p "$SERVER_RES/public"
+cp server.js "$SERVER_RES/"
+cp package.json "$SERVER_RES/"
+cp package-lock.json "$SERVER_RES/"
+cp remote-claude "$SERVER_RES/"
+cp .gitignore "$SERVER_RES/" 2>/dev/null || true
+cp CLAUDE.md "$SERVER_RES/" 2>/dev/null || true
+cp -R public/ "$SERVER_RES/public/"
+
 cat > "${APP_BUNDLE}/Contents/Info.plist" << 'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -82,6 +93,9 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" << 'PLIST'
 </dict>
 </plist>
 PLIST
+
+# Ad-hoc code sign so macOS doesn't flag it as "damaged"
+codesign --force --deep -s - "${APP_BUNDLE}"
 
 # ─── 4. Stage DMG contents ─────────────────────────────────────
 echo "  [4/5] Staging DMG contents..."
