@@ -1,0 +1,368 @@
+#!/bin/bash
+set -e
+
+DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
+PID_FILE="$DIR/remote-claude.pid"
+LOG_FILE="$DIR/remote-claude.log"
+CONFIG_FILE="$HOME/.remote-claude-config"
+NODE_DIR="$HOME/Library/Application Support/Remote Claude"
+NODE="$NODE_DIR/bin/node"
+PORT=3456
+VERSION="1.0"
+
+load_projects_root() {
+  # 1. Use env var if set
+  if [ -n "$PROJECTS_ROOT" ]; then
+    return 0
+  fi
+  # 2. Use saved config
+  if [ -f "$CONFIG_FILE" ]; then
+    PROJECTS_ROOT=$(cat "$CONFIG_FILE")
+    return 0
+  fi
+  # 3. Ask the user
+  echo -e "  ${YELLOW}No projects directory configured.${RESET}"
+  echo -ne "  Enter path to scan for projects: "
+  read -r PROJECTS_ROOT
+  if [ -z "$PROJECTS_ROOT" ]; then
+    echo -e "  ${RED}No path provided. Aborting.${RESET}"
+    exit 1
+  fi
+  # Expand ~ if used
+  PROJECTS_ROOT="${PROJECTS_ROOT/#\~/$HOME}"
+  # Validate
+  if [ ! -d "$PROJECTS_ROOT" ]; then
+    echo -e "  ${RED}Directory does not exist: $PROJECTS_ROOT${RESET}"
+    exit 1
+  fi
+  # Save for next time
+  echo "$PROJECTS_ROOT" > "$CONFIG_FILE"
+  echo -e "  ${GREEN}Saved.${RESET} Use ${DIM}remote-claude set-path <path>${RESET} to change later."
+}
+
+GEMINI_KEY_FILE="$HOME/.gemini-api-key"
+
+load_gemini_key() {
+  # Already have a key file
+  if [ -f "$GEMINI_KEY_FILE" ] && [ -s "$GEMINI_KEY_FILE" ]; then
+    return 0
+  fi
+  # Already have env var
+  if [ -n "$GEMINI_API_KEY" ]; then
+    return 0
+  fi
+  # Ask the user
+  echo -e "  ${YELLOW}No Gemini API key found.${RESET}"
+  echo -e "  ${DIM}Get one at https://aistudio.google.com${RESET}"
+  echo -ne "  Enter Gemini API key (or press Enter to skip): "
+  read -r gemini_key
+  if [ -n "$gemini_key" ]; then
+    echo "$gemini_key" > "$GEMINI_KEY_FILE"
+    echo -e "  ${GREEN}Saved to $GEMINI_KEY_FILE${RESET}"
+  else
+    echo -e "  ${DIM}Skipped. Voice features will be disabled.${RESET}"
+  fi
+}
+
+cmd_set_path() {
+  local new_path="${1/#\~/$HOME}"
+  if [ -z "$new_path" ]; then
+    echo -ne "  Enter path to scan for projects: "
+    read -r new_path
+    new_path="${new_path/#\~/$HOME}"
+  fi
+  if [ ! -d "$new_path" ]; then
+    echo -e "  ${RED}Directory does not exist: $new_path${RESET}"
+    exit 1
+  fi
+  echo "$new_path" > "$CONFIG_FILE"
+  echo -e "  ${GREEN}Projects path set to:${RESET} $new_path"
+}
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+DIM='\033[2m'
+RESET='\033[0m'
+
+get_pid() {
+  if [ -f "$PID_FILE" ]; then
+    local pid
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "$pid"
+      return 0
+    fi
+    rm -f "$PID_FILE"
+  fi
+  return 1
+}
+
+print_banner() {
+  echo -e "${CYAN}${BOLD}"
+  echo "  Remote Claude Server"
+  echo -e "${RESET}${DIM}  ─────────────────────${RESET}"
+}
+
+cmd_start() {
+  print_banner
+  load_projects_root
+  load_gemini_key
+  export PROJECTS_ROOT
+
+  # Kill any previous instance
+  lsof -ti tcp:$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+  rm -f "$PID_FILE"
+  sleep 0.5
+
+  echo -e "  ${GREEN}Starting server...${RESET}"
+  echo -e "  ${DIM}Projects: $PROJECTS_ROOT${RESET}"
+  echo ""
+
+  # Clear old log
+  > "$LOG_FILE"
+
+  # Start in foreground so user sees logs
+  # caffeinate -s prevents system sleep while server runs
+  cd "$DIR" && exec caffeinate -s "$NODE" server.js
+}
+
+cmd_start_bg() {
+  print_banner
+  load_projects_root
+  load_gemini_key
+  export PROJECTS_ROOT
+
+  # Kill any previous instance
+  lsof -ti tcp:$PORT 2>/dev/null | xargs kill -9 2>/dev/null || true
+  rm -f "$PID_FILE"
+  sleep 0.5
+
+  > "$LOG_FILE"
+  cd "$DIR" && PROJECTS_ROOT="$PROJECTS_ROOT" nohup caffeinate -s "$NODE" server.js >> "$LOG_FILE" 2>&1 &
+  local pid=$!
+  sleep 1
+
+  if kill -0 "$pid" 2>/dev/null; then
+    echo -e "  ${GREEN}Server started${RESET} (PID $pid)"
+    echo -e "  ${DIM}Log: $LOG_FILE${RESET}"
+    echo ""
+    head -2 "$LOG_FILE" | while read -r line; do
+      echo -e "  ${DIM}$line${RESET}"
+    done
+  else
+    echo -e "  ${RED}Failed to start.${RESET} Check logs:"
+    cat "$LOG_FILE"
+    exit 1
+  fi
+}
+
+cmd_stop() {
+  print_banner
+  local pid
+  if pid=$(get_pid); then
+    echo -e "  ${YELLOW}Stopping server${RESET} (PID $pid)..."
+    kill "$pid" 2>/dev/null
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -9 "$pid" 2>/dev/null
+    fi
+    rm -f "$PID_FILE"
+    echo -e "  ${GREEN}Stopped.${RESET}"
+  else
+    # Also try killing by port
+    local port_pid
+    port_pid=$(lsof -ti tcp:$PORT 2>/dev/null || true)
+    if [ -n "$port_pid" ]; then
+      echo -e "  ${YELLOW}Stopping process on port $PORT${RESET} (PID $port_pid)..."
+      kill -9 $port_pid 2>/dev/null
+      rm -f "$PID_FILE"
+      echo -e "  ${GREEN}Stopped.${RESET}"
+    else
+      echo -e "  ${DIM}Server is not running.${RESET}"
+    fi
+  fi
+}
+
+cmd_restart() {
+  cmd_stop
+  echo ""
+  sleep 1
+  cmd_start
+}
+
+cmd_status() {
+  print_banner
+  local pid
+  if pid=$(get_pid); then
+    echo -e "  ${GREEN}${BOLD}RUNNING${RESET}  PID: $pid"
+
+    # Get stats from API
+    local stats
+    stats=$(curl -ks "https://localhost:$PORT/api/status" 2>/dev/null || curl -ks "http://localhost:$PORT/api/status" 2>/dev/null || echo "")
+    if [ -n "$stats" ]; then
+      local uptime active total msgs https_on
+      uptime=$(echo "$stats" | python3 -c "import sys,json; u=json.load(sys.stdin)['uptime']; print(f'{u//3600}h {(u%3600)//60}m {u%60}s')" 2>/dev/null || echo "?")
+      active=$(echo "$stats" | python3 -c "import sys,json; print(json.load(sys.stdin)['activeConnections'])" 2>/dev/null || echo "?")
+      total=$(echo "$stats" | python3 -c "import sys,json; print(json.load(sys.stdin)['totalConnections'])" 2>/dev/null || echo "?")
+      msgs=$(echo "$stats" | python3 -c "import sys,json; print(json.load(sys.stdin)['totalMessages'])" 2>/dev/null || echo "?")
+      https_on=$(echo "$stats" | python3 -c "import sys,json; print('Yes' if json.load(sys.stdin)['https'] else 'No')" 2>/dev/null || echo "?")
+
+      echo -e "  ${DIM}Uptime:${RESET}      $uptime"
+      echo -e "  ${DIM}HTTPS:${RESET}       $https_on"
+      echo -e "  ${DIM}Active:${RESET}      $active connection(s)"
+      echo -e "  ${DIM}Total:${RESET}       $total connection(s)"
+      echo -e "  ${DIM}Messages:${RESET}    $msgs"
+    fi
+
+    # Show tailscale URL
+    local ts_ip
+    ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+    if [ -n "$ts_ip" ]; then
+      echo ""
+      echo -e "  ${CYAN}Phone URL:${RESET}   https://$ts_ip:$PORT"
+    fi
+  else
+    local port_pid
+    port_pid=$(lsof -ti tcp:$PORT 2>/dev/null || true)
+    if [ -n "$port_pid" ]; then
+      echo -e "  ${YELLOW}${BOLD}RUNNING${RESET} ${DIM}(no PID file, port in use by PID $port_pid)${RESET}"
+    else
+      echo -e "  ${RED}${BOLD}STOPPED${RESET}"
+    fi
+  fi
+  echo ""
+}
+
+cmd_logs() {
+  print_banner
+  if [ ! -f "$LOG_FILE" ]; then
+    echo -e "  ${DIM}No log file found.${RESET}"
+    exit 0
+  fi
+
+  local lines=${1:-50}
+  echo -e "  ${DIM}Last $lines log lines (live tail with Ctrl+C to exit):${RESET}"
+  echo ""
+
+  # Show recent lines then follow
+  tail -n "$lines" -f "$LOG_FILE" | while read -r line; do
+    # Colorize log levels
+    if echo "$line" | grep -q "ERROR\|FATAL"; then
+      echo -e "  ${RED}$line${RESET}"
+    elif echo "$line" | grep -q "WARN"; then
+      echo -e "  ${YELLOW}$line${RESET}"
+    elif echo "$line" | grep -q "CONN"; then
+      echo -e "  ${GREEN}$line${RESET}"
+    elif echo "$line" | grep -q "DISC"; then
+      echo -e "  ${YELLOW}$line${RESET}"
+    elif echo "$line" | grep -q "START"; then
+      echo -e "  ${CYAN}$line${RESET}"
+    else
+      echo -e "  ${DIM}$line${RESET}"
+    fi
+  done
+}
+
+cmd_url() {
+  local ts_ip
+  ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+  if [ -n "$ts_ip" ]; then
+    echo -e "  ${CYAN}${BOLD}https://$ts_ip:$PORT${RESET}"
+  else
+    echo -e "  ${YELLOW}Tailscale not connected${RESET}"
+    echo -e "  ${DIM}Local: https://localhost:$PORT${RESET}"
+  fi
+}
+
+cmd_set_key() {
+  if [ -n "$1" ]; then
+    echo "$1" > "$GEMINI_KEY_FILE"
+    echo -e "  ${GREEN}Gemini API key saved.${RESET}"
+  else
+    if [ -f "$GEMINI_KEY_FILE" ] && [ -s "$GEMINI_KEY_FILE" ]; then
+      echo -e "  ${DIM}Current key:${RESET} $(cat "$GEMINI_KEY_FILE" | head -c8)..."
+    fi
+    echo -ne "  Enter Gemini API key: "
+    read -r key
+    if [ -n "$key" ]; then
+      echo "$key" > "$GEMINI_KEY_FILE"
+      echo -e "  ${GREEN}Saved to $GEMINI_KEY_FILE${RESET}"
+    fi
+  fi
+}
+
+cmd_cert() {
+  print_banner
+  local ts_ip
+  ts_ip=$(tailscale ip -4 2>/dev/null || echo "")
+  if [ -z "$ts_ip" ]; then
+    echo -e "  ${RED}Tailscale not connected. Connect first.${RESET}"
+    exit 1
+  fi
+
+  mkdir -p "$DIR/certs"
+  openssl req -x509 -newkey rsa:2048 \
+    -keyout "$DIR/certs/key.pem" \
+    -out "$DIR/certs/cert.pem" \
+    -days 365 -nodes \
+    -subj "/CN=remote-claude" \
+    -addext "subjectAltName=IP:$ts_ip" 2>/dev/null
+
+  echo -e "  ${GREEN}Certificate generated for ${BOLD}$ts_ip${RESET}"
+  echo -e "  ${DIM}Restart the server to use the new certificate.${RESET}"
+  echo ""
+}
+
+cmd_version() {
+  echo "  Remote Claude v${VERSION}"
+}
+
+cmd_help() {
+  print_banner
+  echo -e "  ${BOLD}Usage:${RESET} remote-claude [command]"
+  echo ""
+  echo -e "  ${BOLD}Server:${RESET}"
+  echo -e "    ${CYAN}start${RESET}       Start server in foreground (see all output)"
+  echo -e "    ${CYAN}start-bg${RESET}    Start server in background"
+  echo -e "    ${CYAN}stop${RESET}        Stop the server"
+  echo -e "    ${CYAN}restart${RESET}     Restart the server (foreground)"
+  echo -e "    ${CYAN}status${RESET}      Show server status and stats"
+  echo -e "    ${CYAN}logs${RESET} [n]    Tail the log file (default: last 50 lines)"
+  echo ""
+  echo -e "  ${BOLD}Config:${RESET}"
+  echo -e "    ${CYAN}url${RESET}         Show the phone access URL"
+  echo -e "    ${CYAN}cert${RESET}        Generate HTTPS certificate for Tailscale IP"
+  echo -e "    ${CYAN}set-path${RESET}    Set the projects directory"
+  echo -e "    ${CYAN}set-key${RESET}     Set the Gemini API key (for voice mode)"
+  echo ""
+  echo -e "  ${BOLD}Other:${RESET}"
+  echo -e "    ${CYAN}version${RESET}     Show version"
+  echo -e "    ${CYAN}help${RESET}        Show this help"
+  echo ""
+  echo -e "  ${DIM}No argument = start in foreground${RESET}"
+  echo ""
+}
+
+# ─── Main ────────────────────────────────────────────────────────
+case "${1:-start}" in
+  start)      cmd_start ;;
+  start-bg)   cmd_start_bg ;;
+  stop)        cmd_stop ;;
+  restart)     cmd_restart ;;
+  status)      cmd_status ;;
+  logs)        cmd_logs "${2:-50}" ;;
+  url)         cmd_url ;;
+  cert)        cmd_cert ;;
+  set-path)    cmd_set_path "$2" ;;
+  set-key)     cmd_set_key "$2" ;;
+  version|--version|-v) cmd_version ;;
+  help|--help|-h) cmd_help ;;
+  *)
+    echo -e "${RED}Unknown command: $1${RESET}"
+    cmd_help
+    exit 1
+    ;;
+esac

@@ -1,0 +1,351 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <title>Remote Claude</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="theme-color" content="#1a1a2e">
+  <link rel="apple-touch-icon" href="icon-192.png">
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/css/xterm.min.css">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      height: 100dvh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* --- Project Browser --- */
+    #project-screen {
+      display: flex;
+      flex-direction: column;
+      height: 100dvh;
+      padding: 24px;
+      overflow-y: auto;
+      -webkit-overflow-scrolling: touch;
+    }
+    #project-screen h1 {
+      font-size: 28px;
+      color: #c9a0ff;
+      margin-bottom: 4px;
+      text-align: center;
+    }
+    #project-screen .subtitle {
+      color: #888;
+      text-align: center;
+      margin-bottom: 20px;
+      font-size: 14px;
+    }
+    .browse-item {
+      margin-bottom: 6px;
+    }
+    .folder-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 14px 18px;
+      font-size: 17px;
+      background: #16213e;
+      color: #e0e0e0;
+      border: 2px solid #0f3460;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .folder-header:active {
+      background: #0f3460;
+      border-color: #c9a0ff;
+    }
+    .folder-header .icon { font-size: 20px; width: 24px; text-align: center; flex-shrink: 0; }
+    .folder-header .label { flex: 1; }
+    .folder-header .chevron {
+      font-size: 12px;
+      color: #888;
+      transition: transform 0.2s;
+    }
+    .folder-header.open .chevron { transform: rotate(90deg); }
+    .folder-children {
+      display: none;
+      padding-left: 20px;
+      margin-top: 6px;
+    }
+    .folder-children.open { display: block; }
+    .project-entry {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      width: 100%;
+      padding: 14px 18px;
+      font-size: 17px;
+      background: #16213e;
+      color: #e0e0e0;
+      border: 2px solid #0f3460;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-bottom: 6px;
+    }
+    .project-entry:active {
+      background: #0f3460;
+      border-color: #c9a0ff;
+    }
+    .project-entry .icon { font-size: 20px; width: 24px; text-align: center; flex-shrink: 0; color: #c9a0ff; }
+
+    /* --- Session Options --- */
+    #session-options {
+      display: none;
+      flex-direction: column;
+      height: 100dvh;
+      padding: 24px;
+      justify-content: center;
+      align-items: center;
+    }
+    #session-options h2 {
+      font-size: 22px;
+      color: #c9a0ff;
+      margin-bottom: 6px;
+      text-align: center;
+    }
+    #session-options .subtitle {
+      color: #888;
+      text-align: center;
+      margin-bottom: 28px;
+      font-size: 14px;
+    }
+    .session-btn {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      width: 100%;
+      max-width: 360px;
+      padding: 16px 20px;
+      font-size: 17px;
+      background: #16213e;
+      color: #e0e0e0;
+      border: 2px solid #0f3460;
+      border-radius: 10px;
+      cursor: pointer;
+      transition: all 0.15s;
+      margin-bottom: 10px;
+    }
+    .session-btn:active {
+      background: #0f3460;
+      border-color: #c9a0ff;
+    }
+    .session-btn .icon { font-size: 20px; width: 24px; text-align: center; flex-shrink: 0; }
+    .session-btn .label { flex: 1; }
+    .session-btn .desc { font-size: 12px; color: #888; }
+    .session-btn.back {
+      background: transparent;
+      border-color: #333;
+      margin-top: 12px;
+    }
+    .session-btn.back:active {
+      background: #16213e;
+      border-color: #0f3460;
+    }
+
+    /* --- Terminal Screen --- */
+    #terminal-screen { display: none; flex-direction: column; height: 100dvh; }
+    #top-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 6px 12px;
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      flex-shrink: 0;
+    }
+    #top-bar .project-name { font-size: 14px; color: #c9a0ff; font-weight: 600; }
+    #top-bar .controls { display: flex; gap: 8px; align-items: center; }
+    .ctrl-btn {
+      padding: 6px 12px;
+      font-size: 13px;
+      border-radius: 6px;
+      border: 1px solid #0f3460;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      cursor: pointer;
+    }
+    .ctrl-btn.active { background: #0f3460; border-color: #c9a0ff; }
+    #terminal-container {
+      flex: 1;
+      overflow: hidden;
+    }
+    /* Touch scrolling handled by custom JS momentum physics */
+    #terminal-container .xterm-viewport {
+      touch-action: none !important;
+      overscroll-behavior: contain !important;
+    }
+
+    /* --- Control bar --- */
+    #control-bar {
+      display: flex;
+      gap: 6px;
+      padding: 8px 10px;
+      background: #16213e;
+      border-top: 1px solid #0f3460;
+      flex-shrink: 0;
+      justify-content: center;
+      align-items: center;
+    }
+    .ctl {
+      padding: 12px 16px;
+      font-size: 15px;
+      font-weight: 600;
+      border-radius: 8px;
+      border: 1px solid #0f3460;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      cursor: pointer;
+      min-width: 48px;
+      text-align: center;
+      -webkit-tap-highlight-color: transparent;
+      user-select: none;
+    }
+    .ctl:active { background: #0f3460; border-color: #c9a0ff; }
+    .ctl.accent { background: #0f3460; border-color: #c9a0ff; color: #c9a0ff; }
+    .ctl.accent:active { background: #c9a0ff; color: #1a1a2e; }
+    .ctl.gemini { display: flex; align-items: center; justify-content: center; position: relative; }
+    .ctl.gemini.connecting {
+      background: #555;
+      border-color: #888;
+      color: white;
+      animation: pulse-slow 2s infinite;
+    }
+    .ctl.gemini.active {
+      background: #1a7a3a;
+      border-color: #2ecc71;
+      color: white;
+      animation: pulse-med 1.5s infinite;
+    }
+    .ctl.gemini.speaking {
+      background: #6c3483;
+      border-color: #c9a0ff;
+      color: white;
+      animation: pulse-fast 0.8s infinite;
+    }
+    @keyframes pulse-slow {
+      0%, 100% { transform: scale(1); opacity: 0.8; }
+      50% { transform: scale(1.03); opacity: 1; }
+    }
+    @keyframes pulse-med {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.05); }
+    }
+    @keyframes pulse-fast {
+      0%, 100% { transform: scale(1); }
+      50% { transform: scale(1.08); }
+    }
+
+    /* --- Arrow pad --- */
+    #arrow-pad {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 2px;
+      padding: 4px 10px 8px;
+      background: #16213e;
+      flex-shrink: 0;
+    }
+    .arrow-row { display: flex; gap: 2px; }
+    .ctl.arrow { width: 48px; height: 36px; padding: 0; font-size: 14px; }
+
+    /* --- Status bar --- */
+    #status-bar {
+      padding: 4px 12px;
+      font-size: 12px;
+      color: #888;
+      background: #111;
+      text-align: center;
+      flex-shrink: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <!-- Screen 1: Project Browser -->
+  <div id="project-screen">
+    <h1>Remote Claude</h1>
+    <p class="subtitle">Select a project</p>
+    <div id="new-project-btn" class="project-entry" style="margin-bottom: 16px; border-color: #c9a0ff;">
+      <span class="icon" style="color: #2ecc71;">&#10010;</span>
+      <span>Start in Home Directory</span>
+    </div>
+    <div id="project-tree"></div>
+  </div>
+
+  <!-- Screen 1.5: Session Options -->
+  <div id="session-options">
+    <h2 id="session-project-name"></h2>
+    <p class="subtitle">How do you want to start?</p>
+    <button class="session-btn" id="btn-resume">
+      <span class="icon">&#9654;</span>
+      <span class="label">Resume Session<br><span class="desc">Continue the last conversation</span></span>
+    </button>
+    <button class="session-btn" id="btn-new">
+      <span class="icon">&#10010;</span>
+      <span class="label">New Session<br><span class="desc">Start a fresh conversation</span></span>
+    </button>
+    <button class="session-btn" id="btn-yolo">
+      <span class="icon">&#9889;</span>
+      <span class="label">YOLO Mode<br><span class="desc">Skip all permission prompts</span></span>
+    </button>
+    <button class="session-btn back" id="btn-back">
+      <span class="icon">&#8592;</span>
+      <span class="label">Back</span>
+    </button>
+  </div>
+
+  <!-- Screen 2: Terminal + Voice -->
+  <div id="terminal-screen">
+    <div id="top-bar">
+      <span class="project-name" id="current-project"></span>
+      <div class="controls">
+        <button class="ctrl-btn" id="disconnect-btn">Disconnect</button>
+      </div>
+    </div>
+    <div id="terminal-container"></div>
+    <div id="control-bar">
+      <button class="ctl accent" id="btn-enter" title="Enter">Enter</button>
+      <button class="ctl accent" id="btn-toggle-mode" title="Shift+Tab: cycle mode">Mode</button>
+      <button class="ctl gemini" id="gemini-btn" title="Gemini Voice"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></button>
+    </div>
+    <div id="arrow-pad">
+      <div class="arrow-row">
+        <button class="ctl arrow" id="btn-up" title="Up">&#9650;</button>
+      </div>
+      <div class="arrow-row">
+        <button class="ctl arrow" id="btn-left" title="Left">&#9664;</button>
+        <button class="ctl arrow" id="btn-down" title="Down">&#9660;</button>
+        <button class="ctl arrow" id="btn-right" title="Right">&#9654;</button>
+      </div>
+    </div>
+    <div id="status-bar">Ready</div>
+    <div id="debug-panel" style="display:none; position:fixed; bottom:0; left:0; right:0; height:50dvh; background:#111; border-top:2px solid #c9a0ff; z-index:999; flex-direction:column;">
+      <div style="display:flex; justify-content:space-between; padding:6px 10px; background:#1a1a2e; flex-shrink:0;">
+        <span style="color:#c9a0ff; font-size:13px; font-weight:600;">Debug Log</span>
+        <div style="display:flex; gap:8px;">
+          <button onclick="navigator.clipboard.writeText(document.getElementById('debug-log').innerText)" style="background:#0f3460; color:#e0e0e0; border:1px solid #c9a0ff; border-radius:4px; padding:4px 10px; font-size:12px;">Copy All</button>
+          <button onclick="document.getElementById('debug-panel').style.display='none'" style="background:#0f3460; color:#e0e0e0; border:1px solid #c9a0ff; border-radius:4px; padding:4px 10px; font-size:12px;">Close</button>
+        </div>
+      </div>
+      <pre id="debug-log" style="flex:1; overflow-y:auto; padding:8px; font-size:11px; color:#aaa; margin:0; -webkit-overflow-scrolling:touch; user-select:text;"></pre>
+    </div>
+  </div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/xterm@5.5.0/lib/xterm.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-fit@0.10.0/lib/addon-fit.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@xterm/addon-web-links@0.11.0/lib/addon-web-links.min.js"></script>
+  <script src="app.js"></script>
+<!-- Remote Claude by Mads Vejen Langkilde -->
+</body>
+</html>

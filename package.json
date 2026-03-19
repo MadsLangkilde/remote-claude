@@ -1,0 +1,15 @@
+{
+  "name": "remote-claude",
+  "version": "1.0.0",
+  "description": "Remote web interface for Claude Code",
+  "author": "Mads Vejen Langkilde",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.0"
+  }
+}
