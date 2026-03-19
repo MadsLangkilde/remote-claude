@@ -488,15 +488,17 @@ The replay buffer holds the last 100KB of terminal output. When you reconnect, t
 
 ### Option A: macOS App (Recommended)
 
-1. **[Download the DMG](https://github.com/MadsLangkilde/remote-claude/releases/latest)** and drag Remote Claude to Applications
-2. **Launch** it — a mic icon appears in your menu bar
-3. **Click it** and select **Setup Guide...** — this walks you through everything:
-   - Checks Node.js and Claude Code are installed
-   - Explains Tailscale setup
-   - Generates the HTTPS certificate
-   - Sets up Gemini API key
-4. **Start Server** from the menu bar
-5. **Show QR Code** and scan it with your phone
+The DMG is a standalone installer — no git clone needed. The app bundles all server files and sets everything up on first launch.
+
+1. Install **[Node.js](https://nodejs.org)** (v18+) and **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** if you don't have them
+2. **[Download the DMG](https://github.com/MadsLangkilde/remote-claude/releases/latest)** and drag Remote Claude to Applications
+3. **Launch** it — a mic icon appears in your menu bar. On first launch, the app automatically extracts the server files to `~/projects/remote-claude/` and installs npm dependencies
+4. **Click it** and select **Setup Guide...** — this walks you through:
+   - Tailscale setup (so your phone can reach your Mac)
+   - HTTPS certificate generation
+   - Gemini API key (for voice mode)
+5. **Start Server** from the menu bar
+6. **Show QR Code** and scan it with your phone
 
 The menu bar app provides:
 
@@ -513,6 +515,7 @@ The menu bar app provides:
   | Open in Browser          Cmd+O|
   |------------------------------ |
   | Gemini API Key: Set      Cmd+K|
+  | Projects Folder: ~/code  Cmd+P|
   | Setup Guide...                |
   | Show Logs                Cmd+L|
   |------------------------------ |
