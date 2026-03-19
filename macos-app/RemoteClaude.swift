@@ -46,6 +46,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenuBarIcon(running: false)
         ensureServerFiles()
+        clearQuarantine()
         buildMenu()
         startStatusPolling()
 
@@ -141,11 +142,32 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             try? task.run()
             task.waitUntilExit()
 
-            // Fix spawn-helper permissions
+            // Fix spawn-helper permissions and clear quarantine flags
             let helper = "\(PROJECT_DIR)/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper"
             if FileManager.default.fileExists(atPath: helper) {
                 chmod(helper, 0o755)
             }
+            let xattr = Process()
+            xattr.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            xattr.arguments = ["-cr", "\(PROJECT_DIR)/node_modules"]
+            xattr.standardOutput = FileHandle.nullDevice
+            xattr.standardError = FileHandle.nullDevice
+            try? xattr.run()
+            xattr.waitUntilExit()
+        }
+    }
+
+    func clearQuarantine() {
+        // Clear quarantine on node_modules if it exists (fixes Gatekeeper blocks)
+        let nm = "\(PROJECT_DIR)/node_modules"
+        if FileManager.default.fileExists(atPath: nm) {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/xattr")
+            task.arguments = ["-cr", nm]
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+            task.waitUntilExit()
         }
     }
 
