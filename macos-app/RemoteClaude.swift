@@ -45,6 +45,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         updateMenuBarIcon(running: false)
+        ensureServerFiles()
         buildMenu()
         startStatusPolling()
 
@@ -69,6 +70,81 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } else {
                 button.title = running ? "VC" : "vc"
+            }
+        }
+    }
+
+    // ─── Auto-Setup (extract bundled server files on first launch) ──
+    func ensureServerFiles() {
+        let serverJs = "\(PROJECT_DIR)/server.js"
+        // If server files already exist, just ensure dependencies
+        if FileManager.default.fileExists(atPath: serverJs) {
+            ensureDependencies()
+            return
+        }
+
+        // Find bundled server files inside app bundle
+        guard let bundledServer = bundledServerPath() else { return }
+
+        // Create project directory
+        try? FileManager.default.createDirectory(
+            atPath: PROJECT_DIR, withIntermediateDirectories: true)
+
+        // Copy all server files (won't overwrite existing)
+        if let items = try? FileManager.default.contentsOfDirectory(atPath: bundledServer) {
+            for item in items {
+                let src = "\(bundledServer)/\(item)"
+                let dst = "\(PROJECT_DIR)/\(item)"
+                if !FileManager.default.fileExists(atPath: dst) {
+                    try? FileManager.default.copyItem(atPath: src, toPath: dst)
+                }
+            }
+        }
+
+        ensureDependencies()
+    }
+
+    func bundledServerPath() -> String? {
+        // Locate Contents/Resources/server relative to the executable
+        let execPath = ProcessInfo.processInfo.arguments[0]
+        let macosDir = (execPath as NSString).deletingLastPathComponent
+        let contentsDir = (macosDir as NSString).deletingLastPathComponent
+        let serverDir = (contentsDir as NSString)
+            .appendingPathComponent("Resources")
+            .appending("/server")
+        if FileManager.default.fileExists(atPath: serverDir) {
+            return serverDir
+        }
+        return nil
+    }
+
+    func ensureDependencies() {
+        let ptyPath = "\(PROJECT_DIR)/node_modules/node-pty"
+        if FileManager.default.fileExists(atPath: ptyPath) { return }
+
+        // Find npm
+        let npmPaths = ["/usr/local/bin/npm", "/opt/homebrew/bin/npm"]
+        var npmPath: String?
+        for p in npmPaths {
+            if FileManager.default.fileExists(atPath: p) { npmPath = p; break }
+        }
+        guard let npm = npmPath else { return }
+
+        // Run npm install in background
+        DispatchQueue.global().async {
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: npm)
+            task.arguments = ["install"]
+            task.currentDirectoryURL = URL(fileURLWithPath: PROJECT_DIR)
+            task.standardOutput = FileHandle.nullDevice
+            task.standardError = FileHandle.nullDevice
+            try? task.run()
+            task.waitUntilExit()
+
+            // Fix spawn-helper permissions
+            let helper = "\(PROJECT_DIR)/node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper"
+            if FileManager.default.fileExists(atPath: helper) {
+                chmod(helper, 0o755)
             }
         }
     }
