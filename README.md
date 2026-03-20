@@ -114,7 +114,7 @@ After sending a command, a confirmation tone plays immediately. If Claude takes 
 
 1. Install **[Node.js](https://nodejs.org)** (v18+) and **[Claude Code](https://docs.anthropic.com/en/docs/claude-code)** if you don't have them
 2. **[Download the DMG](https://github.com/MadsLangkilde/remote-claude/releases/latest)** and drag Remote Claude to Applications
-3. **Launch** it — a mic icon appears in your menu bar. On first launch, the app extracts server files to `~/projects/remote-claude/` and installs npm dependencies
+3. **Launch** it — if macOS shows "cannot be opened", right-click the app and select **Open**, then click **Open** in the dialog. An icon appears in your menu bar. On first launch, the app extracts server files to `~/projects/remote-claude/` and installs npm dependencies
 4. Click **Setup Guide...** to configure Tailscale, HTTPS certificate, and Gemini API key
 5. **Start Server** from the menu bar
 6. **Show QR Code** and scan it with your phone

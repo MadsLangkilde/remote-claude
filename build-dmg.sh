@@ -133,9 +133,15 @@ cat > "$STAGE/Getting Started.txt" << 'README'
   INSTALL
   ───────
   Drag "Remote Claude" to Applications.
-  Launch it — a mic icon appears in your
-  menu bar. Click "Setup Guide..." to
-  configure everything step by step.
+
+  First launch: right-click the app and
+  select "Open", then click "Open" in the
+  dialog. (macOS blocks unsigned apps on
+  first run — this is a one-time step.)
+
+  An icon appears in your menu bar.
+  Click "Setup Guide..." to configure
+  everything step by step.
 
 
   WHAT YOU CAN DO
