@@ -264,23 +264,33 @@ wss.on('connection', (ws, req) => {
       }
 
       try {
-        // Check if there's a live PTY we can reattach to (regardless of requested mode)
+        // Check if there's a live PTY we can reattach to
+        // If user explicitly chose a different mode (yolo/new), kill the old PTY first
         const existing = ptySessions.get(projectDir);
-        if (existing && !existing.exited) {
-          // Reattach to the live PTY — don't spawn a new one
-          log('INFO', `Reattaching to existing PTY (PID ${existing.pty.pid}) for ${msg.name}`);
-          clearTimeout(existing.killTimer);
-          existing.killTimer = null;
-          currentSession = existing;
-          existing.listeners.add(ws);
+        if (existing && !existing.exited && (msg.mode === 'yolo' || msg.mode === 'new')) {
+          log('INFO', `Killing existing PTY for ${msg.name} (user chose ${msg.mode} mode)`);
+          if (existing.pty) { try { existing.pty.kill(); } catch (e) {} }
+          existing.pty = null;
+          existing.exited = true;
+          ptySessions.delete(projectDir);
+        }
 
-          if (existing.replayBuffer.length > 0) {
-            ws.send(JSON.stringify({ type: 'output', data: existing.replayBuffer }));
+        const existingReattach = ptySessions.get(projectDir);
+        if (existingReattach && !existingReattach.exited) {
+          // Reattach to the live PTY
+          log('INFO', `Reattaching to existing PTY (PID ${existingReattach.pty.pid}) for ${msg.name}`);
+          clearTimeout(existingReattach.killTimer);
+          existingReattach.killTimer = null;
+          currentSession = existingReattach;
+          existingReattach.listeners.add(ws);
+
+          if (existingReattach.replayBuffer.length > 0) {
+            ws.send(JSON.stringify({ type: 'output', data: existingReattach.replayBuffer }));
           }
           ws.send(JSON.stringify({ type: 'started', project: msg.name, reconnected: true }));
 
-          if (existing.pty && msg.cols && msg.rows) {
-            try { existing.pty.resize(msg.cols, msg.rows); } catch (e) {}
+          if (existingReattach.pty && msg.cols && msg.rows) {
+            try { existingReattach.pty.resize(msg.cols, msg.rows); } catch (e) {}
           }
           return;
         }
@@ -288,7 +298,8 @@ wss.on('connection', (ws, req) => {
         // No live PTY — if reconnecting from background or resuming, use --continue
         // so Claude picks up where it left off
         let effectiveMode = msg.mode || 'new';
-        if (existing && existing.exited && effectiveMode === 'new') {
+        const deadSession = ptySessions.get(projectDir);
+        if (deadSession && deadSession.exited && effectiveMode === 'new') {
           // PTY died while user was away — auto-resume instead of starting fresh
           log('INFO', `PTY exited while disconnected for ${msg.name}, auto-resuming with --continue`);
           effectiveMode = 'resume';

@@ -25,6 +25,24 @@ Remote Claude fixes that. Start a session on your Mac, then monitor and control 
 
 ## Features
 
+```
+  +-----------------------------------------------------+
+  |  Project Browser              Terminal + Voice       |
+  |                                                      |
+  |  +------------------+   +--------------------------+ |
+  |  | > projects/      |   | $ claude                 | |
+  |  |   > web-app/     |   |                          | |
+  |  |     my-site      |-->| I'll create the test...  | |
+  |  |   > backend/     |   |                          | |
+  |  |     api-svc      |   | Allow edit? (y/n)        | |
+  |  |   cli-tool       |   |                          | |
+  |  +------------------+   +--------------------------+ |
+  |                          | [Enter] [Mode] [Mic]    | |
+  |  Resume / New / YOLO     | [Up] [Left] [Down] [Rt] | |
+  |                          +--------------------------+ |
+  +------------------------------------------------------+
+```
+
 - **Project browser** — auto-detects projects under `~/projects/` by looking for `.git`, `package.json`, `Cargo.toml`, `go.mod`, `Makefile`, etc.
 - **Session modes** — Resume (continue last conversation), New (fresh start), or YOLO (skip all permission prompts)
 - **Persistent sessions** — PTY stays alive for 30 minutes when your phone goes to sleep. Reconnect and pick up exactly where you left off with full output replay

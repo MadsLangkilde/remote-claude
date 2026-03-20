@@ -81,7 +81,10 @@ let inputFlushTimer = null;
 let isComposing = false; // true during IME composition
 
 function sendInput(data) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    debugLog('WARNING: sendInput dropped — WebSocket not open');
+    return;
+  }
   if (isComposing) return;
 
   inputBuffer += data;
@@ -407,6 +410,7 @@ let sessionTimer = null;
 let playbackQueue = [];
 let isPlaying = false;
 let micMuted = false; // mute mic while Gemini is responding
+let turnComplete = false; // track if turnComplete arrived (for state management)
 let wakeLock = null;
 let keepAliveInterval = null;
 let geminiWasActive = false; // track if Gemini was on before backgrounding
@@ -415,6 +419,7 @@ let geminiContextChars = 0;   // total chars sent to Gemini this session (budget
 const GEMINI_CONTEXT_BUDGET = 30000; // max chars to forward before stopping
 let micMuteTimer = null;      // safety timer to force-unmute mic
 let pendingOutputForward = false; // prevent overlapping output forwards
+let outputForwardedAt = 0; // timestamp of last output forward (to block hallucinated function calls)
 let geminiReconnectAttempts = 0;  // auto-reconnect counter for unexpected disconnects
 const GEMINI_MAX_RECONNECTS = 3; // max retries before giving up
 let voiceWorkingNotificationsEnabled = true; // loaded from server config
@@ -426,48 +431,39 @@ const GEMINI_SYSTEM_PROMPT = `You are a VOICE BRIDGE between the user and Claude
 
 CRITICAL RULES:
 - You control Claude Code running in a terminal. Use function calls to interact with it.
-- ALWAYS call send_text() when the user gives a command or instruction. Do NOT just speak about what you would send — actually call the function.
+- ALWAYS call send_text() when the user gives a SPOKEN command or instruction. Do NOT just speak about what you would send — actually call the function.
+- Pass the user's ACTUAL request to send_text(). If they say "create a bottom navigation", send exactly that — do NOT replace it with a different command like ls or pwd.
 - NEVER have a general conversation or ask clarifying questions. Just relay to Claude.
 - You are a bridge, not an assistant. Send things to Claude and report back what happens.
-- Your audio responses are ONLY for giving feedback about terminal output. When the user speaks a command, your response must be a function call, not audio.
+- NEVER invent, fabricate, or assume commands the user did not speak. If you are unsure what the user said, ask them to repeat.
+- NEVER call send_text() or any function in response to [TERMINAL OUTPUT] messages. Terminal output is READ-ONLY context for you to summarize verbally.
+- NEVER plan or reason about the project. Call send_text() immediately with the user's words. Claude will do the planning.
 
-INTERPRETING SPEECH → send_text():
+INTERPRETING SPEECH:
 - Clean up the user's spoken words into a clear, well-written prompt for Claude.
 - Remove filler words, false starts, and repetitions.
-- If the user rambles or explains at length, distill their intent into a concise instruction.
-- NEVER pass raw technical commands (like "grep" or "find") unless the user specifically asks to run a shell command.
-- Example: user says "uh can you like look through the code and find where the, where the database connection is set up" → send_text("Find where the database connection is configured")
-- Example: user says "make a test for the login function, you know the one in auth.js" → send_text("Write a test for the login function in auth.js")
-- WAIT for the user to finish their thought before calling send_text(). Don't send partial instructions.
+- If the user rambles, distill their intent into a concise instruction.
+- WAIT for the user to finish their thought before calling send_text().
 
-ACTION MAPPING (for short commands):
-- "approve" / "yes" / "yeah" / "go ahead" / "do it" → approve()
-- "no" / "reject" / "cancel" / "don't" → reject()
-- "option 1" / "pick two" / "select 3" → select_option(n)
-- "escape" / "up" / "down" / "tab" → send_special(key)
-- "switch mode" / "toggle mode" → send_special("shift_tab")
+ACTION MAPPING:
+- "approve" / "yes" / "go ahead" → approve()
+- "no" / "reject" / "cancel" → reject()
+- "stop" / "escape" → send_special("escape")
+- "option 1" / "pick two" → select_option(n)
+- "switch mode" → send_special("shift_tab")
 
-VOICE FEEDBACK — THIS IS IMPORTANT:
-- When you see [TERMINAL OUTPUT], ALWAYS give a spoken summary of what happened.
-- Good: "Claude created three new test files and they all pass."
-- Good: "Claude refactored the function and updated the imports."
-- Good: "Claude is asking if it can modify server.js and package.json."
-- Bad: "Done." (too brief — the user can't see the screen!)
+VOICE FEEDBACK:
+- When you see [TERMINAL OUTPUT], give a spoken summary of what happened.
 - If Claude asks a question or needs approval, tell the user what Claude is asking.
 - If Claude shows an error, explain what went wrong.
-- If output is just a progress indicator or trivial, you can stay silent.
-- Remember: the user is on their phone and may not be looking at the screen. Be their eyes.
-
-ACKNOWLEDGMENT RULE:
-- After executing ANY function call, you MUST immediately give a very brief spoken confirmation: "Sent", "Done", "Approved", or similar. Maximum 2 words.
-- Do NOT wait for terminal output before acknowledging. The user needs instant feedback that their voice command was received.
-- After acknowledging, wait for terminal output before saying anything more.`;
+- Say "On it" after calling a function so the user knows it was received.
+- Always call send_text(), never just speak the command.`;
 
 const GEMINI_TOOLS = [{
   functionDeclarations: [
     {
       name: 'send_text',
-      description: 'Type text into the Claude terminal followed by Enter. Use for instructions, questions, or any text input.',
+      description: 'Type text into the Claude terminal followed by Enter.',
       parameters: {
         type: 'object',
         properties: { text: { type: 'string', description: 'The text to type' } },
@@ -483,7 +479,6 @@ const GEMINI_TOOLS = [{
           key: {
             type: 'string',
             enum: ['enter', 'escape', 'up', 'down', 'left', 'right', 'tab', 'shift_tab'],
-            description: 'The special key to send',
           },
         },
         required: ['key'],
@@ -491,12 +486,12 @@ const GEMINI_TOOLS = [{
     },
     {
       name: 'approve',
-      description: 'Approve/confirm a prompt from Claude by sending y + Enter. Use when user says yes, approve, go ahead, confirm, etc.',
+      description: 'Send y + Enter to approve a prompt from Claude.',
       parameters: { type: 'object', properties: {} },
     },
     {
       name: 'reject',
-      description: 'Reject/deny a prompt from Claude by sending n + Enter. Use when user says no, reject, deny, cancel, etc.',
+      description: 'Send n + Enter to reject a prompt from Claude.',
       parameters: { type: 'object', properties: {} },
     },
     {
@@ -529,10 +524,15 @@ function muteMic(reason) {
   clearTimeout(micMuteTimer);
   micMuteTimer = setTimeout(() => {
     if (micMuted) {
-      debugLog(`Safety unmute — mic was muted for 10s (reason: ${reason})`);
+      debugLog(`Safety unmute — mic was muted for 5s with no audio (reason: ${reason})`);
       micMuted = false;
+      turnComplete = false;
+      playbackQueue = [];
+      isPlaying = false;
+      setGeminiState('active');
+      playReadyBeep();
     }
-  }, 10000);
+  }, 5000);
 }
 
 function unmuteMic() {
@@ -556,6 +556,24 @@ function playConfirmationTone() {
     gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.1);
     osc.start(ctx.currentTime);
     osc.stop(ctx.currentTime + 0.1);
+  } catch (e) {}
+}
+
+// ── Ready beep (subtle low tone when mic unmutes after Gemini speaks) ──
+function playReadyBeep() {
+  try {
+    const ctx = audioContext || new AudioContext({ sampleRate: 24000 });
+    if (ctx.state === 'suspended') ctx.resume();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.type = 'sine';
+    osc.frequency.value = 440;
+    gain.gain.setValueAtTime(0.06, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.08);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.08);
   } catch (e) {}
 }
 
@@ -642,13 +660,15 @@ function geminiBufferOutput(raw) {
       return;
     }
 
-    // Categorize the output
+    // Only forward output that Gemini needs to know about:
+    // 1. Related to a Gemini function call (user asked for something — up to 5 min)
+    // 2. Claude is asking a question/needs approval
+    // Do NOT forward unsolicited output — Gemini hallucinates commands from it.
     const timeSinceAction = Date.now() - lastFunctionCallTime;
     const isActionResult = timeSinceAction < 30000; // within 30s of a function call
     const looksLikePrompt = /\?\s*$|\(y\/n\)|approve|permission|allow|do you want|should I/i.test(content);
-    const isSubstantial = content.length > 50; // not just a blank line or spinner
 
-    if (!isActionResult && !looksLikePrompt && !isSubstantial) {
+    if (!isActionResult && !looksLikePrompt) {
       return;
     }
 
@@ -668,19 +688,23 @@ function geminiBufferOutput(raw) {
     geminiContextChars += content.length;
 
     // Determine the right instruction prefix
+    // CRITICAL: every prefix must tell Gemini NOT to call functions — only summarize verbally
     let prefix;
     if (looksLikePrompt) {
-      prefix = '[TERMINAL OUTPUT — Claude is asking the user something. Tell the user clearly what Claude wants to know or what it needs approval for. IMPORTANT: Use your function-calling tools to interact with the terminal — do NOT just speak commands aloud.]';
+      prefix = '[TERMINAL OUTPUT — Claude is asking the user for permission or input. You MUST speak this out loud so the user can respond. Tell the user clearly what Claude is asking. DO NOT call any function.]';
     } else if (isActionResult) {
-      prefix = '[TERMINAL OUTPUT — This is the result of your last action. Give the user a helpful voice summary of what Claude did, what changed, any errors, or any results. Do NOT just say "Done". IMPORTANT: Use your function-calling tools to interact with the terminal — do NOT just speak commands aloud.]';
+      prefix = '[TERMINAL OUTPUT — Result of your last action. You MUST give a brief spoken summary of what happened. DO NOT call any function.]';
     } else {
-      prefix = '[TERMINAL OUTPUT — Claude produced some output. Summarize what happened for the user. IMPORTANT: Use your function-calling tools to interact with the terminal — do NOT just speak commands aloud.]';
+      prefix = '[TERMINAL OUTPUT — Claude produced output. Give a brief spoken summary. DO NOT call any function.]';
     }
 
     // Do NOT mute mic here — muting is only done during Gemini audio playback
     // (handled by serverContent.modelTurn). Muting here caused deadlocks when
     // Gemini decided not to respond to forwarded output, leaving mic permanently muted.
     pendingOutputForward = true;
+    outputForwardedAt = Date.now();
+    // Safety: clear the flag after 8s if Gemini never responds
+    setTimeout(() => { pendingOutputForward = false; }, 8000);
     geminiSession.send(JSON.stringify({
       clientContent: {
         turns: [{ role: 'user', parts: [{ text: `${prefix}\n${content}` }] }],
@@ -700,13 +724,23 @@ function sendInputThenEnter(text) {
 }
 
 function executeGeminiFunctionCall(call) {
+  const args = call.args || {};
+  debugLog(`EXEC: ${call.name}(${JSON.stringify(args).slice(0, 80)})`);
+
+  // Don't beep or start working timer for empty/meaningless calls
+  if (call.name === 'send_text' && !args.text) {
+    debugLog('WARNING: send_text called with empty text — ignoring');
+    return { result: 'ignored' };
+  }
+
   lastFunctionCallTime = Date.now();
   playConfirmationTone();
   startWorkingNotifications();
-  const args = call.args || {};
+
   switch (call.name) {
     case 'send_text':
-      if (args.text) sendInputThenEnter(args.text);
+      debugLog(`Sending to PTY: "${args.text.slice(0, 60)}"`);
+      sendInputThenEnter(args.text);
       return { result: 'sent' };
     case 'send_special':
       if (args.key && SPECIAL_KEYS[args.key]) sendInput(SPECIAL_KEYS[args.key]);
@@ -734,11 +768,19 @@ function scheduleAudioPlayback(pcm16Base64) {
 async function drainPlaybackQueue() {
   if (playbackQueue.length === 0) {
     isPlaying = false;
-    if (geminiState === 'speaking') setGeminiState('active');
+    // If turnComplete already arrived, NOW go green
+    if (turnComplete) {
+      unmuteMic();
+      suppressInitialAudio = false;
+      setGeminiState('active');
+      playReadyBeep();
+      turnComplete = false;
+      debugLog('Audio done + turn complete — listening');
+    }
     return;
   }
   isPlaying = true;
-  if (geminiState === 'active') setGeminiState('speaking');
+  setGeminiState('speaking');
 
   const chunk = playbackQueue.shift();
   const raw = atob(chunk);
@@ -902,22 +944,24 @@ async function connectGemini() {
       // Auto-reconnect before 10-min limit
       clearTimeout(sessionTimer);
       sessionTimer = setTimeout(() => renewGeminiSession(), SESSION_RENEW_MS);
-      // Send current terminal screen so Gemini has context (especially after reconnect).
-      // Without this, Gemini has no notion of a terminal and may just talk instead of
-      // using function calls.
-      const screen = getTerminalScreen();
-      if (screen.length > 10 && geminiSession.readyState === WebSocket.OPEN) {
+      // Send a tools reminder (no terminal content — that caused hallucinations).
+      // Without this, Gemini sometimes forgets it has function-calling tools
+      // and just speaks instead of acting.
+      if (geminiSession.readyState === WebSocket.OPEN) {
         suppressInitialAudio = true;
+        const projectInfo = currentProject
+          ? `The user is working in a project called "${currentProject.name}" at ${currentProject.path}.`
+          : 'The user is in their home directory.';
         geminiSession.send(JSON.stringify({
           clientContent: {
             turns: [{ role: 'user', parts: [{ text:
-              `[SYSTEM: Terminal context loaded. Current screen below. Do NOT speak or make any sound in response to this message. Wait silently for the user's voice input.]\n${screen.slice(-2000)}`
+              `[SYSTEM: ${projectInfo} Use your function-calling tools to interact with the terminal. Do not assume the project type. Wait for the user to speak.]`
             }] }],
             turnComplete: true,
           },
         }));
-        debugLog(`Sent ${screen.length} chars of terminal context to Gemini`);
       }
+      debugLog('Gemini ready — context sent, waiting for voice input');
     }
 
     // Server content (audio/text response)
@@ -925,9 +969,12 @@ async function connectGemini() {
       // Model is responding — mute mic to prevent interruption
       if (msg.serverContent.modelTurn) {
         muteMic('modelTurn');
+        turnComplete = false; // new response starting
         const parts = msg.serverContent.modelTurn.parts || [];
         for (const part of parts) {
           if (part.inlineData && part.inlineData.mimeType?.startsWith('audio/')) {
+            // Reset safety unmute timer — Gemini is still actively sending audio
+            if (micMuted) muteMic('audioChunk');
             if (suppressInitialAudio) {
               debugLog('Suppressed initial context response audio');
             } else {
@@ -941,13 +988,20 @@ async function connectGemini() {
       }
       // Turn complete — unmute mic, clear pending output forward flag
       if (msg.serverContent.turnComplete) {
-        unmuteMic();
         pendingOutputForward = false;
-        if (suppressInitialAudio) {
+        if (isPlaying) {
+          // Audio still playing — defer going green until audio finishes
+          turnComplete = true;
           suppressInitialAudio = false;
-          debugLog('Turn complete — initial audio suppressed, mic unmuted');
+          debugLog('Turn complete — waiting for audio to finish');
         } else {
-          debugLog('Turn complete — mic unmuted');
+          // No audio playing — go green now
+          unmuteMic();
+          suppressInitialAudio = false;
+          turnComplete = false;
+          setGeminiState('active');
+          playReadyBeep();
+          debugLog('Turn complete — mic unmuted, listening');
         }
       }
       // Interrupted
@@ -963,7 +1017,16 @@ async function connectGemini() {
     if (msg.toolCall) {
       const calls = msg.toolCall.functionCalls || [];
       const responses = [];
+      const timeSinceOutputForward = Date.now() - outputForwardedAt;
       for (const call of calls) {
+        // Block function calls triggered by forwarded terminal output (not user voice).
+        // Gemini hallucinates commands from output context. Voice commands take >3s to
+        // process, so anything within 5s of an output forward is almost certainly hallucinated.
+        if (timeSinceOutputForward < 5000) {
+          debugLog(`BLOCKED: ${call.name}(${JSON.stringify(call.args || {}).slice(0, 40)}) — triggered by output, not voice`);
+          responses.push({ id: call.id, name: call.name, response: { result: 'ignored — waiting for voice command' } });
+          continue;
+        }
         setStatus(`Gemini → ${call.name}(${JSON.stringify(call.args || {}).slice(0, 40)})`);
         const result = executeGeminiFunctionCall(call);
         responses.push({ id: call.id, name: call.name, response: result });
@@ -1016,6 +1079,7 @@ function disconnectGemini() {
   pendingOutputForward = false;
   clearWorkingNotifications();
   suppressInitialAudio = false;
+  outputForwardedAt = 0;
   stopMicCapture();
   stopKeepAlive();
   releaseWakeLock();
@@ -1158,6 +1222,7 @@ function setStatus(text) {
 document.addEventListener('DOMContentLoaded', () => {
   loadProjects();
 
+  document.getElementById('btn-escape').addEventListener('click', () => sendInput('\x1b'));
   document.getElementById('btn-up').addEventListener('click', () => sendInput('\x1b[A'));
   document.getElementById('btn-down').addEventListener('click', () => sendInput('\x1b[B'));
   document.getElementById('btn-left').addEventListener('click', () => sendInput('\x1b[D'));
@@ -1165,7 +1230,30 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-enter').addEventListener('click', () => sendInput('\r'));
   document.getElementById('btn-toggle-mode').addEventListener('click', () => sendInput('\x1b[Z'));
 
-  document.getElementById('gemini-btn').addEventListener('click', (e) => {
+  // Tap mic: toggle voice on/off. Long-press: reset session (clears confused context).
+  let geminiPressTimer = null;
+  let geminiLongPressed = false;
+  const geminiBtn = document.getElementById('gemini-btn');
+  geminiBtn.addEventListener('touchstart', () => {
+    geminiLongPressed = false;
+    geminiPressTimer = setTimeout(() => {
+      geminiLongPressed = true;
+      if (geminiState !== 'idle') {
+        setStatus('Resetting voice session...');
+        renewGeminiSession();
+      }
+    }, 800);
+  }, { passive: true });
+  geminiBtn.addEventListener('touchend', (e) => {
+    clearTimeout(geminiPressTimer);
+    if (!geminiLongPressed) {
+      e.preventDefault();
+      toggleGemini();
+    }
+  });
+  // Fallback for desktop click
+  geminiBtn.addEventListener('click', (e) => {
+    if (e.sourceCapabilities && e.sourceCapabilities.firesTouchEvents) return;
     e.preventDefault();
     toggleGemini();
   });

@@ -5,8 +5,17 @@ DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/nul
 PID_FILE="$DIR/remote-claude.pid"
 LOG_FILE="$DIR/remote-claude.log"
 CONFIG_FILE="$HOME/.remote-claude-config"
-NODE_DIR="$HOME/Library/Application Support/Remote Claude"
-NODE="$NODE_DIR/bin/node"
+# Find node: try common paths
+if command -v node &>/dev/null; then
+  NODE="$(command -v node)"
+elif [ -x /usr/local/bin/node ]; then
+  NODE=/usr/local/bin/node
+elif [ -x /opt/homebrew/bin/node ]; then
+  NODE=/opt/homebrew/bin/node
+else
+  echo "  Node.js not found. Install it from nodejs.org"
+  exit 1
+fi
 PORT=3456
 VERSION="1.0"
 

@@ -5,309 +5,152 @@ A web-based mobile interface for Claude Code, accessible from a phone via Tailsc
 ## Project Structure
 
 ```
-~/projects/remote-claude/
-  server.js              # Node.js server (Express + WebSocket + node-pty)
-  public/
-    index.html           # Frontend — project browser + terminal UI
-    app.js               # Frontend logic — WebSocket, xterm.js, Gemini voice, touch
-    audio-worklet-processor.js  # AudioWorklet — mic capture, downsample to 16kHz PCM16
-  remote-claude          # CLI management script (start/stop/status/logs)
-  macos-app/
-    RemoteClaude.swift   # macOS menu bar app source
-  certs/
-    cert.pem / key.pem   # Self-signed HTTPS cert (for Tailscale IP YOUR_TAILSCALE_IP)
-  remote-claude.log      # Runtime log file
-  remote-claude.pid      # PID file for running server
-  package.json           # Dependencies: express, ws, node-pty
-  ~/.gemini-api-key      # Gemini API key (not in repo)
+remote-claude/
+├── server.js                  # HTTPS + WebSocket + node-pty server
+├── public/
+│   ├── index.html             # Project browser + terminal UI
+│   ├── app.js                 # Frontend logic, Gemini voice, touch
+│   └── audio-worklet-processor.js  # Mic capture, downsample to 16kHz
+├── remote-claude              # CLI script (start/stop/status/logs)
+├── macos-app/
+│   └── RemoteClaude.swift     # Menu bar app source
+├── certs/
+│   ├── cert.pem               # Self-signed HTTPS cert
+│   └── key.pem                # (for Tailscale IP)
+├── package.json               # express, ws, node-pty
+└── ~/.gemini-api-key          # Gemini API key (not in repo)
 ```
 
 ## Architecture
 
+```
+  ┌──────────┐         ┌──────────────┐         ┌──────────────┐
+  │  Phone   │◄──wss──►│   Server     │         │ Google Gemini│
+  │  Browser │         │  :3456       │         │ Live API     │
+  └────┬─────┘         └──────┬───────┘         └──────┬───────┘
+       │                      │                        │
+       │  mic audio ─────────────────────────────────►│
+       │◄──────────────────────────────── voice reply  │
+       │                      │                        │
+       │  function calls ◄────┤◄──── tool calls ───────┤
+       │  (terminal input)    │                        │
+       │─────────────────────►│                        │
+       │                      ├──► Claude Code (PTY)   │
+       │                      │◄── terminal output ────┤
+       │◄── replay buffer ────┤    (debounced, 4KB)    │
+       │                      │                        │
+```
+
 ### Server (`server.js`)
-- HTTPS server on port **3456** (falls back to HTTP if no certs)
-- Serves static files from `public/`
-- **Persistent PTY sessions** — PTYs survive WebSocket disconnects (phone standby):
-  - `start` message → reattaches to existing PTY or spawns new `claude` via node-pty
-  - `input` message → writes to PTY stdin
-  - `resize` message → resizes PTY
-  - `output` message → sends PTY stdout to all connected listeners
-  - 5-minute grace period before killing orphaned PTYs
-  - 50KB replay buffer — reconnecting clients see recent output
-- API endpoints:
-  - `GET /api/projects` — scans `~/projects/` recursively, returns folder/project tree
-  - `GET /api/status` — returns uptime, connections, message count
-  - `POST /api/gemini-token` — returns Gemini API key (Tailscale-only, not public)
-- Project detection: checks for `.git`, `CLAUDE.md`, `package.json`, `CMakeLists.txt`, `build.gradle`, `build.gradle.kts`, `Cargo.toml`, `go.mod`, `Makefile`
-- Structured logging with levels: INFO, CONN, DISC, START, WARN, ERROR, FATAL
+- HTTPS on port **3456** (falls back to HTTP if no certs)
+- Persistent PTY sessions — survive WebSocket disconnects (phone standby)
+- 50KB replay buffer for reconnecting clients
+- 5-minute grace period before killing orphaned PTYs
+- API: `GET /api/projects`, `GET /api/status`, `POST /api/gemini-token`
 
 ### Frontend (`public/index.html` + `public/app.js`)
-- **Screen 1**: Project browser — folders expand, projects open Claude sessions
-- **Screen 2**: Terminal (xterm.js) with control bar:
-  - Arrow keys (up/down/left/right), Enter, Mode (Shift+Tab), Gemini Voice
-  - Touch scrolling with momentum/flick
-  - Auto-reconnect WebSocket on background→foreground (reattaches to existing PTY)
-- **Gemini Voice** — see Gemini Live Voice Assistant section below
+- **Screen 1**: Project browser with expandable folders
+- **Screen 2**: xterm.js terminal with touch controls + Gemini voice
 
 ### macOS App (`macos-app/RemoteClaude.swift`)
-- Menu bar app (no Dock icon, `LSUIElement = true`)
-- Shows server status with mic icon (filled = running)
-- Start/Stop server, Copy Phone URL, Open in Browser, Show Logs
-- Log viewer window with color-coded entries
-- Compiled with: `swiftc -O -o macos-app/RemoteClaude macos-app/RemoteClaude.swift -framework Cocoa`
-- Installed at: `~/Applications/Remote Claude.app`
-- Uses full path `/usr/local/bin/node` (NOT `env node` — macOS apps don't have shell PATH)
+- Menu bar app (`LSUIElement = true`, no Dock icon)
+- Start/Stop server, Copy Phone URL, Show Logs
+- Uses `/usr/local/bin/node` (macOS apps don't have shell PATH)
 
 ### CLI (`remote-claude` script)
-- Symlinked from `~/.local/bin/remote-claude`
-- Commands: `start`, `start-bg`, `stop`, `restart`, `status`, `logs`, `help`
+- Commands: `start`, `start-bg`, `stop`, `restart`, `status`, `logs`
 
-## Gemini Live Voice Assistant
+## Gemini Voice Assistant
 
-Gemini acts as an intelligent voice intermediary between you and Claude Code.
-Instead of raw speech-to-text, Gemini understands your intent and executes
-terminal actions via function calling.
+Gemini is a voice bridge between you and Claude Code. It translates speech into terminal actions via function calling.
 
-### How It Works
+### Voice Commands
 
-```
-                          Tailscale (private network)
-  +----------+    wss     +-------------+    wss     +------------------+
-  |  Phone   |<---------->|   Server    |            | Google Gemini    |
-  |  Browser |  terminal  |  server.js  |            | Live API         |
-  +----------+  I/O       +------+------+            +------------------+
-       |                         |                          ^    |
-       |    voice (mic audio)    |                          |    |
-       +-------------------------------------------------------->|
-       |                         |     PCM16 @ 16kHz        |    |
-       |                         |     base64 via WS        |    |
-       |<--------------------------------------------------------+
-       |    Gemini audio response (PCM16 @ 24kHz)           |    |
-       |                         |                          |    |
-       |    function calls       |                          |    |
-       |    (send_text, approve) |                          |    |
-       |<------------------------|<----- toolCall ----------|    |
-       |    terminal input       |                               |
-       +------------------------>|                               |
-              sendInput()        |  pty.write()                  |
-                                 +-----> Claude Code             |
-                                 |                               |
-                                 |  terminal output              |
-                                 +------- clientContent -------->|
-                                    (debounced, stripped,         |
-                                     truncated to 4KB)           |
-```
+| You say              | Action                          |
+|----------------------|---------------------------------|
+| "create tests"       | `send_text("create tests")`     |
+| "approve" / "yes"    | `approve()` → sends `y↵`       |
+| "no" / "reject"      | `reject()` → sends `n↵`        |
+| "option 2"           | `select_option(2)` → sends `2↵`|
+| "escape" / "stop"    | `send_special("escape")`        |
+| "switch mode"        | `send_special("shift_tab")`     |
 
-### Voice Flow (step by step)
+### Output Summarization
+
+Terminal output is stripped, debounced (2.5s), truncated to 4KB, and forwarded to Gemini as context. Gemini summarizes it, alerts on questions/approvals, or stays silent for trivial output.
+
+### Connection Lifecycle
 
 ```
-  You say          Gemini understands       Action
-  ──────────       ─────────────────        ──────────────────────
-  "approve that"   intent: approve     -->  sends y + Enter to PTY
-  "create tests"   intent: send text   -->  types "create tests" + Enter
-  "option 2"       intent: select #2   -->  sends 2 + Enter to PTY
-  "no"             intent: reject      -->  sends n + Enter to PTY
-  "switch mode"    intent: cycle mode  -->  sends Shift+Tab to PTY
-```
-
-### Terminal Output Summarization
-
-```
-  Claude output (500 lines)
-        |
-        v
-  stripAnsi() --> debounce 1.5s --> truncate >4KB (head+tail)
-        |
-        v
-  Send as clientContent to Gemini
-        |
-        v
-  Gemini decides:
-    - Summarize: "Done -- created 3 test files, all passing"
-    - Alert:     "Claude is asking for approval to edit main.rs"
-    - Silent:    (progress bar, trivial output -- says nothing)
-```
-
-### Gemini Connection Lifecycle
-
-```
-  Tap mic button
-       |
-       v
-  [idle] ---> POST /api/gemini-token ---> [connecting]
-                                               |
-       Open WebSocket to Gemini                |
-       wss://generativelanguage.googleapis.com/ws/...?key=API_KEY
-                                               |
-       Send setup { model, tools, config }     |
-                                               v
-       Receive { setupComplete }          [active] (green pulse)
-                                               |
-       Start AudioWorklet mic capture          |
-       Stream PCM16 @ 16kHz to Gemini          |
-                                               |
-       ~~~~ 9 minutes pass ~~~~                |
-                                               v
-       Auto-renew: disconnect + reconnect [connecting] -> [active]
-                                               |
-       Tap mic again or disconnect             |
-                                               v
-       Close WebSocket, stop mic          [idle]
+  Tap mic → fetch API key → open WebSocket → send setup
+       → setupComplete → start mic capture → [active]
+       → auto-renew at 9 min → tap mic to disconnect
 ```
 
 ### Button States
 
-```
-  State        Color     Animation       Meaning
-  ─────        ─────     ─────────       ───────
-  idle         dark      none            not connected
-  connecting   grey      slow pulse      getting token / connecting
-  active       green     medium pulse    listening for speech
-  speaking     purple    fast pulse      Gemini is talking
-```
+| State      | Color  | Animation   |
+|------------|--------|-------------|
+| idle       | dark   | none        |
+| connecting | grey   | slow pulse  |
+| active     | green  | medium pulse|
+| speaking   | purple | fast pulse  |
 
 ### Audio Pipeline
 
 ```
-  Mic (48kHz native)
-       |
-       v
-  AudioWorklet (audio-worklet-processor.js)
-       |  downsample 48kHz -> 16kHz
-       |  float32 -> Int16 PCM
-       v
-  Main thread
-       |  Int16 -> base64
-       v
-  WebSocket to Gemini
-       |  { realtimeInput: { mediaChunks: [{ mimeType, data }] } }
-       v
-  Gemini processes speech
-       |
-       v
-  Response: inlineData (audio/pcm @ 24kHz)
-       |  base64 -> Int16 -> float32
-       v
-  AudioContext (24kHz) -> speakers
+  Mic 48kHz → AudioWorklet (downsample to 16kHz PCM16)
+    → base64 → WebSocket → Gemini
+    → response audio 24kHz PCM16 → speakers
 ```
 
-### Mic Muting (echo prevention)
-
-```
-  You speak ---> Gemini starts responding
-                      |
-                 micMuted = true  (stop sending audio)
-                      |
-                 Gemini speaks / executes function calls
-                      |
-                 { turnComplete: true }
-                      |
-                 micMuted = false  (resume sending audio)
-```
-
-### PTY Persistence (phone standby)
-
-```
-  Phone active         Phone standby          Phone wakes up
-  ────────────         ──────────────         ─────────────────
-  Browser <--WS--> Server               Browser reconnects WS
-                      |                        |
-                   WS drops                 send { type: start }
-                      |                        |
-                   PTY stays alive!         Server finds existing PTY
-                   (5-min grace)               |
-                      |                     Replay 50KB of recent output
-                   Buffers all output          |
-                   from Claude              Client sees current state
-```
-
-### Function Calling Tools
-
-| Tool              | Gemini calls when...                        | Sends to PTY  |
-|-------------------|---------------------------------------------|---------------|
-| `send_text(text)` | User gives an instruction to type           | `text` + `\r` |
-| `send_special(k)` | User says "escape", "up", "tab", etc.       | escape seq     |
-| `approve()`       | User says "yes", "approve", "go ahead"      | `y` + `\r`    |
-| `reject()`        | User says "no", "reject", "cancel"          | `n` + `\r`    |
-| `select_option(n)`| User says "option 1", "pick two"            | `n` + `\r`    |
+Mic is muted while Gemini speaks (echo prevention), unmuted on `turnComplete`.
 
 ### Debug Panel
 
-Long-press the status bar (bottom of screen) to toggle the debug log panel.
-Shows all Gemini messages, mic status, and connection events.
-Has a "Copy All" button for sharing logs.
+Long-press the status bar to toggle. Shows Gemini messages, mic status, connection events. "Copy All" button for sharing logs.
 
-## Critical Things to Know
+## Critical Rules
 
-### Environment Issues (MUST handle)
-- **CLAUDECODE env var**: MUST delete from env before spawning claude, or it refuses to start ("nested session" error)
-- **PATH not available**: When running via nohup, macOS app, or launchd, the shell PATH is minimal. Always use full paths:
-  - Node: `/usr/local/bin/node`
-  - Claude: `~/.local/bin/claude`
-- **node-pty spawn-helper**: The prebuilt binary at `node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper` MUST have execute permission (`chmod +x`). Without it, every `pty.spawn()` fails with `posix_spawnp failed`
-- Claude is spawned via `/bin/zsh -l -c ~/.local/bin/claude` to get a login shell environment
+### Environment
+- **Delete `CLAUDECODE` env var** before spawning claude (prevents "nested session" error)
+- **Use full paths** — `/usr/local/bin/node`, `~/.local/bin/claude` (no `env`)
+- **`spawn-helper` must be executable** — `chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper`
+- Claude spawned via `/bin/zsh -l -c ~/.local/bin/claude` for login shell env
 
-### Server Stability (MUST handle)
-- **PTY sessions are persistent**: PTYs live in `ptySessions` Map, survive WebSocket disconnects. Set `session.pty = null` and `session.exited = true` in the `onExit` handler
-- **Wrap `pty.resize()` in try/catch**: Race condition between exit and resize
-- **Wrap `pty.spawn()` in try/catch**: Send error message to client instead of crashing
-- **Add `wss.on('error', () => {})` handler**: The WebSocketServer re-emits server errors; without a handler it crashes with unhandled error
-- **EADDRINUSE**: The `remote-claude` script kills port 3456 before starting. The server also has `server.on('error')` for graceful handling
-- **Grace period**: When all listeners disconnect, PTY stays alive 5 minutes. Reconnecting reattaches and replays buffered output
+### Server Stability
+- PTYs persist in `ptySessions` Map — set `session.pty = null` and `session.exited = true` in `onExit`
+- Wrap `pty.resize()` and `pty.spawn()` in try/catch
+- Add `wss.on('error', () => {})` handler (prevents crash on re-emitted errors)
 
-### HTTPS / Mobile Access
-- Self-signed cert generated for Tailscale IP: `openssl req -x509 -newkey rsa:2048 ... -addext "subjectAltName=IP:YOUR_TAILSCALE_IP"`
-- Phone must accept the cert warning in browser
-- Required for: microphone access (getUserMedia needs HTTPS on non-localhost)
-- WebSocket auto-detects `wss://` vs `ws://` based on page protocol
+### HTTPS / Mobile
+- Self-signed cert for Tailscale IP (required for mic access on mobile)
+- Font size ≥ 16px on inputs (prevents iOS auto-zoom)
+- `visibilitychange` listener for WebSocket reconnect after backgrounding
 
-### Mobile UX
-- Font size >= 16px on inputs to prevent iOS auto-zoom
-- `touch-action: pan-y` on terminal container
-- Custom touch scroll handler with momentum for flick scrolling
-- `visibilitychange` listener to reconnect WebSocket when Chrome comes back from background
-- `100dvh` for proper mobile viewport height
-
-## Do NOT
-
-- Do NOT use `env node` or bare `node` in the macOS app or any non-shell context — use `/usr/local/bin/node`
-- Do NOT use `env claude` — use full path `~/.local/bin/claude`
-- Do NOT forget to delete `CLAUDECODE` from the environment before spawning claude
-- Do NOT remove the try/catch around `pty.resize()` — it will crash the server
-- Do NOT remove `session.pty = null` from the `onExit` handler
-- Do NOT kill PTYs on WebSocket disconnect — they must persist for phone standby reconnects
-- Do NOT send Gemini API key over public networks — server only serves it over Tailscale
-- Do NOT use the `audio` field in Gemini `realtimeInput` — use `mediaChunks` (the "deprecated" format still works, `audio` does not)
-- Do NOT set `spawn-helper` permissions to non-executable
-- Do NOT serve over plain HTTP if you want microphone to work on mobile
-- Do NOT use `term.focus()` on mobile — it steals focus from the control buttons
-- Do NOT add `LSUIElement = false` to the macOS app — it should stay menu-bar-only
+### Do NOT
+- Use `env node` or `env claude` — use full paths
+- Remove try/catch around `pty.resize()` or `session.pty = null` from `onExit`
+- Kill PTYs on WebSocket disconnect — they must persist for phone standby
+- Use `audio` field in Gemini `realtimeInput` — use `mediaChunks`
+- Use `term.focus()` on mobile — steals focus from controls
+- Serve over plain HTTP if you want mic to work
 
 ## Building & Deploying
 
-### Rebuild macOS app
 ```bash
-cd ~/projects/remote-claude
+# Rebuild macOS app
 swiftc -O -o macos-app/RemoteClaude macos-app/RemoteClaude.swift -framework Cocoa
-# Then update the installed app:
 cp macos-app/RemoteClaude ~/Applications/Remote\ Claude.app/Contents/MacOS/RemoteClaude
-# Or rebuild installer:
-pkgbuild --root ~/Applications/Remote\ Claude.app --identifier com.local.remote-claude --version 1.x --install-location "/Applications/Remote Claude.app" ~/Desktop/RemoteClaude.pkg
-```
 
-### Regenerate HTTPS cert (if Tailscale IP changes)
-```bash
-openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem -days 365 -nodes -subj "/CN=remote-claude" -addext "subjectAltName=IP:<NEW_IP>"
-```
+# Regenerate HTTPS cert (if Tailscale IP changes)
+openssl req -x509 -newkey rsa:2048 -keyout certs/key.pem -out certs/cert.pem \
+  -days 365 -nodes -subj "/CN=remote-claude" -addext "subjectAltName=IP:<NEW_IP>"
 
-### After npm install / node upgrade
-```bash
+# After npm install / node upgrade
 chmod +x node_modules/node-pty/prebuilds/darwin-arm64/spawn-helper
-```
 
-### Set up Gemini voice
-```bash
-# Get a key from https://aistudio.google.com
+# Set up Gemini voice (key from https://aistudio.google.com)
 echo "YOUR_KEY" > ~/.gemini-api-key
 remote-claude restart
 ```
