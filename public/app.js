@@ -524,7 +524,13 @@ function muteMic(reason) {
   clearTimeout(micMuteTimer);
   micMuteTimer = setTimeout(() => {
     if (micMuted) {
-      debugLog(`Safety unmute — mic was muted for 5s with no audio (reason: ${reason})`);
+      // Don't force-unmute while audio is still playing back
+      if (isPlaying || playbackQueue.length > 0) {
+        debugLog(`Safety timer deferred — audio still playing (reason: ${reason})`);
+        muteMic('playback-defer'); // restart the timer
+        return;
+      }
+      debugLog(`Safety unmute — mic was muted for 15s with no audio (reason: ${reason})`);
       micMuted = false;
       turnComplete = false;
       playbackQueue = [];
@@ -532,7 +538,7 @@ function muteMic(reason) {
       setGeminiState('active');
       playReadyBeep();
     }
-  }, 5000);
+  }, 15000);
 }
 
 function unmuteMic() {
