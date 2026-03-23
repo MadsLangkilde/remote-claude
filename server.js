@@ -10,6 +10,7 @@ const os = require('os');
 const PORT = 3456;
 const HOME = os.homedir();
 const PROJECTS_ROOT = process.env.PROJECTS_ROOT;
+const UPLOAD_DIR = path.join(os.tmpdir(), 'remote-claude-uploads');
 if (!PROJECTS_ROOT) {
   console.error('FATAL: PROJECTS_ROOT environment variable is required. Set it to the directory to scan for projects.');
   process.exit(1);
@@ -62,6 +63,9 @@ if (fs.existsSync(geminiKeyPath)) {
 } else {
   log('WARN', 'No Gemini API key found (check ~/.gemini-api-key or GEMINI_API_KEY)');
 }
+
+// Ensure upload directory exists
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 const app = express();
 app.use(express.json());
@@ -143,6 +147,21 @@ app.post('/api/gemini-token', (_req, res) => {
   res.json({ apiKey: geminiApiKey });
 });
 
+// API: File upload (images, PDFs, etc. for Claude to analyze)
+app.post('/api/upload', express.raw({ type: '*/*', limit: '20mb' }), (req, res) => {
+  try {
+    const origName = req.headers['x-filename'] || 'upload';
+    const safeName = origName.replace(/[^a-zA-Z0-9._-]/g, '_');
+    const filePath = path.join(UPLOAD_DIR, `${Date.now()}-${safeName}`);
+    fs.writeFileSync(filePath, req.body);
+    log('INFO', `File uploaded: ${filePath} (${req.body.length} bytes)`);
+    res.json({ path: filePath });
+  } catch (e) {
+    log('ERROR', `Upload failed: ${e.message}`);
+    res.status(500).json({ error: e.message });
+  }
+});
+
 const server = useHttps
   ? https.createServer({ cert: fs.readFileSync(certFile), key: fs.readFileSync(keyFile) }, app)
   : http.createServer(app);
@@ -181,6 +200,8 @@ function getOrCreatePty(projectDir, msg) {
   let claudeCmd = claudePath;
   if (msg.mode === 'resume') {
     claudeCmd = `${claudePath} --continue`;
+  } else if (msg.mode === 'resume-pick') {
+    claudeCmd = `${claudePath} --resume`;
   } else if (msg.mode === 'yolo') {
     claudeCmd = `${claudePath} --dangerously-skip-permissions`;
   }
@@ -267,7 +288,7 @@ wss.on('connection', (ws, req) => {
         // Check if there's a live PTY we can reattach to
         // If user explicitly chose a different mode (yolo/new), kill the old PTY first
         const existing = ptySessions.get(projectDir);
-        if (existing && !existing.exited && (msg.mode === 'yolo' || msg.mode === 'new')) {
+        if (existing && !existing.exited && (msg.mode === 'yolo' || msg.mode === 'new' || msg.mode === 'resume-pick')) {
           log('INFO', `Killing existing PTY for ${msg.name} (user chose ${msg.mode} mode)`);
           if (existing.pty) { try { existing.pty.kill(); } catch (e) {} }
           existing.pty = null;

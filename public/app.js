@@ -1236,6 +1236,30 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('btn-enter').addEventListener('click', () => sendInput('\r'));
   document.getElementById('btn-toggle-mode').addEventListener('click', () => sendInput('\x1b[Z'));
 
+  // Attach file (image, PDF, etc.) — upload to server, insert path into terminal
+  document.getElementById('btn-attach').addEventListener('click', () => {
+    document.getElementById('file-input').click();
+  });
+  document.getElementById('file-input').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    setStatus(`Uploading ${file.name}...`);
+    try {
+      const res = await fetch('/api/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': file.type || 'application/octet-stream', 'X-Filename': file.name },
+        body: file,
+      });
+      const data = await res.json();
+      if (data.error) throw new Error(data.error);
+      sendInput(data.path);
+      setStatus(`Attached: ${file.name}`);
+    } catch (err) {
+      setStatus(`Upload failed: ${err.message}`);
+    }
+    e.target.value = ''; // reset for next upload
+  });
+
   // Tap mic: toggle voice on/off. Long-press: reset session (clears confused context).
   let geminiPressTimer = null;
   let geminiLongPressed = false;
@@ -1294,6 +1318,9 @@ document.addEventListener('DOMContentLoaded', () => {
   // Session option buttons
   document.getElementById('btn-resume').addEventListener('click', () => {
     if (currentProject) launchSession(currentProject, 'resume');
+  });
+  document.getElementById('btn-pick-session').addEventListener('click', () => {
+    if (currentProject) launchSession(currentProject, 'resume-pick');
   });
   document.getElementById('btn-new').addEventListener('click', () => {
     if (currentProject) launchSession(currentProject, 'new');
