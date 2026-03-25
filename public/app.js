@@ -8,6 +8,7 @@ let ws = null;
 let term = null;
 let fitAddon = null;
 let currentProject = null;
+let currentMode = null; // track session mode for reconnection
 
 // ─── Project Browser ─────────────────────────────────────────────
 async function loadProjects() {
@@ -69,6 +70,7 @@ function startSession(entry) {
 }
 
 function launchSession(entry, mode) {
+  currentMode = mode; // remember for reconnection
   document.getElementById('session-options').style.display = 'none';
   document.getElementById('terminal-screen').style.display = 'flex';
   document.getElementById('current-project').textContent = entry.name;
@@ -145,13 +147,61 @@ function initTerminal(entry, mode) {
   term.onData((data) => sendInput(data));
 
   // Hook into IME composition events on xterm's hidden textarea.
-  // During composition (CJK input, some Android IMEs), suppress intermediate
+  // During composition (CJK input, Android Gboard, etc.), suppress intermediate
   // onData events so the terminal doesn't receive partial input.
   requestAnimationFrame(() => {
     const textarea = container.querySelector('.xterm-helper-textarea');
     if (textarea) {
       textarea.addEventListener('compositionstart', () => { isComposing = true; });
-      textarea.addEventListener('compositionend', () => { isComposing = false; });
+      textarea.addEventListener('compositionend', () => {
+        isComposing = false;
+        // Android (Gboard): clear residual textarea content after composition ends.
+        // Gboard accumulates text state across compositions and uses it for
+        // post-composition autocorrect/suggestions. If stale text remains in the
+        // textarea, tapping a suggestion can re-insert an already-sent word.
+        // Clearing after a short delay (xterm processes the value synchronously
+        // before this fires) prevents Gboard from building up that state.
+        setTimeout(() => {
+          if (!isComposing && textarea.value.length > 0) {
+            textarea.value = '';
+          }
+        }, 100);
+      });
+
+      // Disable keyboard autocomplete/autocorrect/suggestions.
+      // On Android, Gboard routes ALL input through IME composition — including
+      // suggestion bar taps (insertCompositionText, which is NOT cancelable).
+      // These attributes suppress the suggestion bar itself.
+      const antiAutoAttrs = {
+        'autocomplete': 'off',
+        'autocorrect': 'off',
+        'autocapitalize': 'off',
+        'spellcheck': 'false',
+        'aria-autocomplete': 'none',
+      };
+      const enforceAttrs = () => {
+        for (const [key, val] of Object.entries(antiAutoAttrs)) {
+          if (textarea.getAttribute(key) !== val) {
+            textarea.setAttribute(key, val);
+          }
+        }
+      };
+      enforceAttrs();
+
+      // Re-apply attributes if xterm resets them (e.g. on resize/refocus)
+      new MutationObserver(() => enforceAttrs()).observe(textarea, {
+        attributes: true,
+        attributeFilter: Object.keys(antiAutoAttrs),
+      });
+
+      // Block iOS QuickType replacement insertions (insertReplacementText).
+      // Android never fires this event — it uses insertCompositionText instead,
+      // which is handled by the composition guards above.
+      textarea.addEventListener('beforeinput', (e) => {
+        if (e.inputType === 'insertReplacementText') {
+          e.preventDefault();
+        }
+      }, { capture: true });
     }
   });
 
@@ -177,15 +227,20 @@ function connectWebSocket(entry, mode) {
   let suppressGeminiForward = true; // suppress until 'started' msg (skip replay buffer)
 
   ws.onopen = () => {
-    setStatus('Connected — starting Claude...');
-    ws.send(JSON.stringify({
+    setStatus(mode === 'reconnect' ? 'Reconnecting...' : 'Connected — starting Claude...');
+    const msg = {
       type: 'start',
       name: entry.name,
       path: entry.path,
       mode: mode || 'new',
       cols: term ? term.cols : 80,
       rows: term ? term.rows : 24,
-    }));
+    };
+    // Include original mode so server can restart with correct flags if PTY died
+    if (mode === 'reconnect' && currentMode) {
+      msg.originalMode = currentMode;
+    }
+    ws.send(JSON.stringify(msg));
   };
 
   ws.onmessage = (event) => {
@@ -242,21 +297,22 @@ function scheduleReconnect(entry) {
     reconnectTimer = null;
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       setStatus('Reconnecting...');
-      connectWebSocket(entry);
+      connectWebSocket(entry, 'reconnect');
     }
   }, 2000);
 }
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'visible' && currentProject) {
-    // Reconnect terminal WebSocket if needed
+    // Reconnect terminal WebSocket if needed — use 'reconnect' mode so
+    // the server reattaches to the existing PTY instead of killing it
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       setStatus('Reconnecting...');
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
       }
-      connectWebSocket(currentProject);
+      connectWebSocket(currentProject, 'reconnect');
     }
     // Reconnect Gemini if it was active before backgrounding
     if (geminiWasActive && (!geminiSession || geminiSession.readyState !== WebSocket.OPEN)) {
@@ -279,11 +335,10 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
-// ─── Touch Scrolling (custom momentum physics) ─────────────────
-// xterm.js converts scroll positions to discrete line offsets, which makes
-// native touch scrolling feel jerky (line-by-line jumps). Instead, we
-// intercept touch events and implement our own momentum scrolling that
-// accumulates fractional lines and scrolls at 60fps for a smooth feel.
+// ─── Touch Scrolling (pixel-smooth via scrollTop) ───────────────
+// xterm.js's scrollLines() moves in discrete line jumps. Instead, we
+// directly manipulate viewport.scrollTop for pixel-level smooth scrolling
+// with momentum physics.
 function setupTouchScroll(container) {
   requestAnimationFrame(() => {
     const viewport = container.querySelector('.xterm-viewport');
@@ -297,13 +352,10 @@ function setupTouchScroll(container) {
     let lastY = 0;
     let velocity = 0;
     let lastTime = 0;
-    let lineAccum = 0;        // fractional line accumulator
     let momentumRAF = null;
-    const LINE_HEIGHT = 18;   // approximate px per terminal line
-    const FRICTION = 0.94;    // velocity decay per frame (lower = more friction)
-    const MIN_VELOCITY = 0.3; // stop momentum below this px/ms
-    const VELOCITY_SCALE = 0.6; // dampen raw velocity for smoother feel
-    // Track recent velocities for a weighted average (prevents sudden jumps)
+    const FRICTION = 0.95;    // velocity decay per frame
+    const MIN_VELOCITY = 0.2; // stop momentum below this px/ms
+    const VELOCITY_SCALE = 0.6;
     let velocitySamples = [];
     const MAX_SAMPLES = 5;
 
@@ -312,7 +364,6 @@ function setupTouchScroll(container) {
       cancelAnimationFrame(momentumRAF);
       momentumRAF = null;
       velocity = 0;
-      lineAccum = 0;
       velocitySamples = [];
       const touch = e.touches[0];
       lastY = touch.clientY;
@@ -321,7 +372,7 @@ function setupTouchScroll(container) {
 
     viewport.addEventListener('touchmove', (e) => {
       if (!touching) return;
-      e.preventDefault(); // prevent any residual browser scroll
+      e.preventDefault();
 
       const touch = e.touches[0];
       const now = performance.now();
@@ -329,18 +380,12 @@ function setupTouchScroll(container) {
       const deltaT = now - lastTime;
 
       if (deltaT > 0) {
-        const sample = deltaY / deltaT; // px/ms
-        velocitySamples.push(sample);
+        velocitySamples.push(deltaY / deltaT);
         if (velocitySamples.length > MAX_SAMPLES) velocitySamples.shift();
       }
 
-      // Accumulate fractional lines and scroll when we cross a whole line
-      lineAccum += deltaY / LINE_HEIGHT;
-      const lines = Math.trunc(lineAccum);
-      if (lines !== 0) {
-        term.scrollLines(lines);
-        lineAccum -= lines;
-      }
+      // Direct pixel scrolling — no line snapping
+      viewport.scrollTop += deltaY;
 
       lastY = touch.clientY;
       lastTime = now;
@@ -348,7 +393,6 @@ function setupTouchScroll(container) {
 
     viewport.addEventListener('touchend', () => {
       touching = false;
-      // Weighted average of recent velocity samples (latest = most weight)
       if (velocitySamples.length > 0) {
         let total = 0, weight = 0;
         for (let i = 0; i < velocitySamples.length; i++) {
@@ -358,7 +402,6 @@ function setupTouchScroll(container) {
         }
         velocity = (total / weight) * VELOCITY_SCALE;
       }
-      lineAccum = 0;
       if (Math.abs(velocity) > MIN_VELOCITY) startMomentum();
     }, { passive: true });
 
@@ -369,14 +412,7 @@ function setupTouchScroll(container) {
         const dt = now - lastFrame;
         lastFrame = now;
 
-        // Convert velocity (px/ms) to line delta over this frame
-        const pxDelta = velocity * dt;
-        lineAccum += pxDelta / LINE_HEIGHT;
-        const lines = Math.trunc(lineAccum);
-        if (lines !== 0) {
-          term.scrollLines(lines);
-          lineAccum -= lines;
-        }
+        viewport.scrollTop += velocity * dt;
 
         velocity *= FRICTION;
         if (Math.abs(velocity) > MIN_VELOCITY) {
@@ -1300,6 +1336,7 @@ document.addEventListener('DOMContentLoaded', () => {
       ws = null;
     }
     currentProject = null;
+    currentMode = null;
     document.getElementById('terminal-screen').style.display = 'none';
     document.getElementById('project-screen').style.display = 'flex';
   });

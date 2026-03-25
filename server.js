@@ -204,6 +204,8 @@ function getOrCreatePty(projectDir, msg) {
     claudeCmd = `${claudePath} --resume`;
   } else if (msg.mode === 'yolo') {
     claudeCmd = `${claudePath} --dangerously-skip-permissions`;
+  } else if (msg.mode === 'yolo-resume') {
+    claudeCmd = `${claudePath} --continue --dangerously-skip-permissions`;
   }
 
   const ptyProcess = pty.spawn('/bin/zsh', ['-l', '-c', claudeCmd], {
@@ -287,6 +289,7 @@ wss.on('connection', (ws, req) => {
       try {
         // Check if there's a live PTY we can reattach to
         // If user explicitly chose a different mode (yolo/new), kill the old PTY first
+        // 'reconnect' mode means auto-reconnect from backgrounding — always reattach
         const existing = ptySessions.get(projectDir);
         if (existing && !existing.exited && (msg.mode === 'yolo' || msg.mode === 'new' || msg.mode === 'resume-pick')) {
           log('INFO', `Killing existing PTY for ${msg.name} (user chose ${msg.mode} mode)`);
@@ -316,18 +319,40 @@ wss.on('connection', (ws, req) => {
           return;
         }
 
-        // No live PTY — if reconnecting from background or resuming, use --continue
-        // so Claude picks up where it left off
+        // No live PTY — determine how to start/resume
         let effectiveMode = msg.mode || 'new';
-        const deadSession = ptySessions.get(projectDir);
-        if (deadSession && deadSession.exited && effectiveMode === 'new') {
-          // PTY died while user was away — auto-resume instead of starting fresh
-          log('INFO', `PTY exited while disconnected for ${msg.name}, auto-resuming with --continue`);
-          effectiveMode = 'resume';
-          ws.send(JSON.stringify({
-            type: 'output',
-            data: '\r\n\x1b[33m[Session ended while you were away — auto-resuming conversation...]\x1b[0m\r\n',
-          }));
+
+        // 'reconnect' means the browser reconnected after backgrounding.
+        // If PTY died, auto-resume. Use original mode flags (e.g. yolo) if provided.
+        if (effectiveMode === 'reconnect') {
+          const deadSession = ptySessions.get(projectDir);
+          if (deadSession && deadSession.exited) {
+            log('INFO', `PTY exited while disconnected for ${msg.name}, auto-resuming`);
+            // Combine resume with original mode flags (e.g. yolo + resume)
+            effectiveMode = msg.originalMode === 'yolo' ? 'yolo-resume' : 'resume';
+            ws.send(JSON.stringify({
+              type: 'output',
+              data: '\r\n\x1b[33m[Session ended while you were away — auto-resuming conversation...]\x1b[0m\r\n',
+            }));
+          } else {
+            // No PTY at all (cleaned up) — resume last conversation
+            log('INFO', `No PTY found for ${msg.name} on reconnect, resuming last session`);
+            effectiveMode = msg.originalMode === 'yolo' ? 'yolo-resume' : 'resume';
+            ws.send(JSON.stringify({
+              type: 'output',
+              data: '\r\n\x1b[33m[Reconnected — resuming conversation...]\x1b[0m\r\n',
+            }));
+          }
+        } else if (effectiveMode === 'new') {
+          const deadSession = ptySessions.get(projectDir);
+          if (deadSession && deadSession.exited) {
+            log('INFO', `PTY exited while disconnected for ${msg.name}, auto-resuming with --continue`);
+            effectiveMode = 'resume';
+            ws.send(JSON.stringify({
+              type: 'output',
+              data: '\r\n\x1b[33m[Session ended while you were away — auto-resuming conversation...]\x1b[0m\r\n',
+            }));
+          }
         }
 
         const { session } = getOrCreatePty(projectDir, { ...msg, mode: effectiveMode });
