@@ -287,13 +287,17 @@
   <div id="session-options">
     <h2 id="session-project-name"></h2>
     <p class="subtitle">How do you want to start?</p>
+    <button class="session-btn" id="btn-rejoin" style="display:none; border-color:#2ecc71">
+      <span class="icon" style="color:#2ecc71">&#9679;</span>
+      <span class="label">Rejoin Live Session<br><span class="desc">Reconnect to your running Claude instance</span></span>
+    </button>
     <button class="session-btn" id="btn-resume">
       <span class="icon">&#9654;</span>
-      <span class="label">Resume Last<br><span class="desc">Continue the most recent conversation</span></span>
+      <span class="label">Resume Last<br><span class="desc">Continue your latest conversation (from any device)</span></span>
     </button>
     <button class="session-btn" id="btn-pick-session">
       <span class="icon">&#128203;</span>
-      <span class="label">Pick Session<br><span class="desc">Choose from past conversations</span></span>
+      <span class="label">Pick Session<br><span class="desc">Browse and resume any past conversation</span></span>
     </button>
     <button class="session-btn" id="btn-new">
       <span class="icon">&#10010;</span>

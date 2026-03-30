@@ -11,9 +11,17 @@ let currentProject = null;
 let currentMode = null; // track session mode for reconnection
 
 // ─── Project Browser ─────────────────────────────────────────────
+let activeSessions = new Set(); // paths with live PTY sessions
+
 async function loadProjects() {
-  const res = await fetch('/api/projects');
+  const [res, sessRes] = await Promise.all([
+    fetch('/api/projects'),
+    fetch('/api/sessions').catch(() => ({ json: () => [] })),
+  ]);
   const tree = await res.json();
+  const sessions = await sessRes.json();
+  activeSessions = new Set(sessions.map(s => s.path));
+
   const container = document.getElementById('project-tree');
   container.innerHTML = '';
   renderTree(tree, container);
@@ -55,7 +63,9 @@ function renderTree(entries, parent) {
     } else {
       const btn = document.createElement('div');
       btn.className = 'project-entry';
-      btn.innerHTML = `<span class="icon">&#128196;</span><span>${entry.name}</span>`;
+      const isActive = activeSessions.has(entry.path);
+      const indicator = isActive ? '<span style="color:#2ecc71;font-size:10px;margin-left:auto;flex-shrink:0">&#9679; live</span>' : '';
+      btn.innerHTML = `<span class="icon">&#128196;</span><span>${entry.name}</span>${indicator}`;
       btn.addEventListener('click', () => startSession(entry));
       parent.appendChild(btn);
     }
@@ -67,6 +77,9 @@ function startSession(entry) {
   document.getElementById('project-screen').style.display = 'none';
   document.getElementById('session-options').style.display = 'flex';
   document.getElementById('session-project-name').textContent = entry.name;
+  // Show rejoin button only when a live PTY exists for this project
+  document.getElementById('btn-rejoin').style.display =
+    activeSessions.has(entry.path) ? 'flex' : 'none';
 }
 
 function launchSession(entry, mode) {
@@ -221,6 +234,30 @@ function initTerminal(entry, mode) {
 
 // ─── WebSocket with auto-reconnect ──────────────────────────────
 function connectWebSocket(entry, mode) {
+  // Clean up any existing WebSocket to prevent duplicate connections.
+  // Without this, the old WS's onclose fires after we create the new one,
+  // triggering scheduleReconnect and opening a parallel connection.
+  if (ws) {
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.onmessage = null;
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      ws.close();
+    }
+    ws = null;
+  }
+  if (reconnectTimer) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+
+  // On reconnect, reset terminal so the replay buffer provides a fresh view.
+  // Without this, the replay buffer is written on top of existing content,
+  // causing duplicated/corrupted output.
+  if (mode === 'reconnect' && term) {
+    term.reset();
+  }
+
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
 
@@ -265,6 +302,7 @@ function connectWebSocket(entry, mode) {
     if (msg.type === 'started') {
       suppressGeminiForward = false; // replay done — allow Gemini forwarding
       outputBuffer = ''; // discard any replay content already buffered
+      reconnectAttempts = 0; // reset backoff on successful connection
       setStatus(msg.reconnected ? `Reconnected to ${msg.project}` : `Claude running in ${msg.project}`);
       if (msg.reconnected) {
         // After replay buffer has been written, scroll to bottom
@@ -291,15 +329,21 @@ function connectWebSocket(entry, mode) {
 }
 
 let reconnectTimer = null;
+let reconnectAttempts = 0;
+const RECONNECT_MAX_DELAY = 30000;
+
 function scheduleReconnect(entry) {
   if (reconnectTimer) return;
+  reconnectAttempts++;
+  const delay = Math.min(1000 * Math.pow(1.5, reconnectAttempts - 1), RECONNECT_MAX_DELAY);
+  setStatus(`Disconnected — reconnecting in ${Math.round(delay / 1000)}s...`);
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;
     if (!ws || ws.readyState === WebSocket.CLOSED) {
       setStatus('Reconnecting...');
       connectWebSocket(entry, 'reconnect');
     }
-  }, 2000);
+  }, delay);
 }
 
 document.addEventListener('visibilitychange', () => {
@@ -308,6 +352,7 @@ document.addEventListener('visibilitychange', () => {
     // the server reattaches to the existing PTY instead of killing it
     if (!ws || ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       setStatus('Reconnecting...');
+      reconnectAttempts = 0; // fresh start — user just foregrounded
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1339,6 +1384,7 @@ document.addEventListener('DOMContentLoaded', () => {
     currentMode = null;
     document.getElementById('terminal-screen').style.display = 'none';
     document.getElementById('project-screen').style.display = 'flex';
+    loadProjects(); // refresh active session indicators
   });
 
   // Long-press status bar to toggle debug panel
@@ -1353,6 +1399,9 @@ document.addEventListener('DOMContentLoaded', () => {
   statusBar.addEventListener('touchend', () => clearTimeout(statusPressTimer), { passive: true });
 
   // Session option buttons
+  document.getElementById('btn-rejoin').addEventListener('click', () => {
+    if (currentProject) launchSession(currentProject, 'resume');
+  });
   document.getElementById('btn-resume').addEventListener('click', () => {
     if (currentProject) launchSession(currentProject, 'resume');
   });

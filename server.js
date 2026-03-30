@@ -24,10 +24,18 @@ let totalConnections = 0;
 let totalMessages = 0;
 const startTime = Date.now();
 
+const LOG_MAX_BYTES = 1024 * 1024; // 1MB — rotate when exceeded
+
 function log(level, msg) {
   const ts = new Date().toISOString().replace('T', ' ').replace('Z', '');
   const line = `[${ts}] ${level.padEnd(5)} ${msg}`;
   console.log(line);
+  try {
+    const stat = fs.statSync(LOG_FILE).size;
+    if (stat > LOG_MAX_BYTES) {
+      fs.renameSync(LOG_FILE, LOG_FILE + '.old');
+    }
+  } catch {}
   fs.appendFileSync(LOG_FILE, line + '\n');
 }
 
@@ -42,8 +50,19 @@ function logStats() {
 // Write PID file
 fs.writeFileSync(PID_FILE, process.pid.toString());
 process.on('exit', () => { try { fs.unlinkSync(PID_FILE); } catch {} });
-process.on('SIGTERM', () => { log('INFO', 'Received SIGTERM, shutting down'); process.exit(0); });
-process.on('SIGINT', () => { log('INFO', 'Received SIGINT, shutting down'); process.exit(0); });
+
+function gracefulShutdown(signal) {
+  log('INFO', `Received ${signal}, killing ${ptySessions.size} PTY session(s)...`);
+  for (const [dir, session] of ptySessions) {
+    if (session.pty && !session.exited) {
+      try { session.pty.kill(); } catch {}
+    }
+  }
+  ptySessions.clear();
+  process.exit(0);
+}
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 // HTTPS certs (self-signed for Tailscale access)
 const certDir = path.join(__dirname, 'certs');
@@ -66,6 +85,22 @@ if (fs.existsSync(geminiKeyPath)) {
 
 // Ensure upload directory exists
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
+
+// Clean up uploaded files older than 1 hour (runs every 10 minutes)
+const UPLOAD_MAX_AGE_MS = 60 * 60 * 1000;
+setInterval(() => {
+  try {
+    const now = Date.now();
+    for (const name of fs.readdirSync(UPLOAD_DIR)) {
+      const fp = path.join(UPLOAD_DIR, name);
+      const age = now - fs.statSync(fp).mtimeMs;
+      if (age > UPLOAD_MAX_AGE_MS) {
+        fs.unlinkSync(fp);
+        log('INFO', `Cleaned up old upload: ${name}`);
+      }
+    }
+  } catch {}
+}, 10 * 60 * 1000);
 
 const app = express();
 app.use(express.json());
@@ -139,6 +174,17 @@ app.get('/api/config', (_req, res) => {
   });
 });
 
+// API: active PTY sessions (so the project browser can show indicators)
+app.get('/api/sessions', (_req, res) => {
+  const sessions = [];
+  for (const [dir, session] of ptySessions) {
+    if (!session.exited) {
+      sessions.push({ path: dir, name: session.name, listeners: session.listeners.size });
+    }
+  }
+  res.json(sessions);
+});
+
 // API: Gemini API key (served over Tailscale only — not public)
 app.post('/api/gemini-token', (_req, res) => {
   if (!geminiApiKey) {
@@ -185,11 +231,10 @@ function getOrCreatePty(projectDir, msg) {
   delete env.CLAUDECODE;
   if (fs.existsSync(keychainPwPath)) {
     const pw = fs.readFileSync(keychainPwPath, 'utf-8').trim();
-    const { execSync } = require('child_process');
+    const { execFileSync } = require('child_process');
     try {
-      execSync(`security unlock-keychain -p "${pw}" ~/Library/Keychains/login.keychain-db`, {
-        stdio: 'ignore',
-      });
+      execFileSync('security', ['unlock-keychain', '-p', pw,
+        path.join(HOME, 'Library/Keychains/login.keychain-db')], { stdio: 'ignore' });
     } catch (e) {
       log('WARN', `Failed to unlock keychain: ${e.message}`);
     }
